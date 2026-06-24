@@ -1322,7 +1322,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        # 禁用 router TE GEMM，强制走 torch.mm 以对齐 PaddleFleet。
+        # te_general_gemm 在 fp32 router_dtype 下与 PF 的 matmul 选不同 cuBLAS 算法，
+        # 导致 gate_logits 末位 diff，叠加 topk 离散选择后 router_output_0/1 翻转。
+        # if te_general_gemm is not None and router_dtype != torch.float64:
+        if False:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1355,7 +1359,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        # 禁用 TE GEMM 以对齐 PF 精度
+        # if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        if False:
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
