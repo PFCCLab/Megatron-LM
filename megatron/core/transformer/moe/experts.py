@@ -613,13 +613,14 @@ class TEGroupedMLP(MegatronModule):
             and getattr(self.config, "moe_token_dispatcher_type", None) == "flex"
             and getattr(self.config, "moe_flex_dispatcher_backend", None) == "hybridep"
         )
+        # HybridEP static-budget padding and FP8/FP4 quantization padding both produce
+        # Python-list counts; convert once below before calling the TE op-fuser.
+        tokens_per_expert_needs_device_copy = False
         if is_hybridep_full_cg:
             tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            tokens_per_expert = self._tokens_per_expert_to_device(
-                tokens_per_expert, permuted_local_hidden_states.device
-            )
+            tokens_per_expert_needs_device_copy = True
 
         # HybridEP full-CG may size probabilities to the static dispatch budget; trim them
         # before the fused MLP consumes the dispatched hidden rows.
@@ -650,8 +651,10 @@ class TEGroupedMLP(MegatronModule):
                 permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
             )
             permuted_probs = permuted_probs.squeeze(-1)
+            tokens_per_expert_needs_device_copy = True
+        if tokens_per_expert_needs_device_copy:
             tokens_per_expert = self._tokens_per_expert_to_device(
-                tokens_per_expert, permuted_probs.device
+                tokens_per_expert, permuted_local_hidden_states.device
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
