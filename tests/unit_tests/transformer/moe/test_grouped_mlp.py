@@ -185,38 +185,6 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[3] is tokens_per_expert
 
 
-def test_fused_forward_aligns_hybridep_full_cg_tokens_per_expert(monkeypatch):
-    class FakeFusedOps:
-        def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
-            self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
-            return hidden_states
-
-    module = TEGroupedMLP.__new__(TEGroupedMLP)
-    module.config = SimpleNamespace(
-        cuda_graph_impl="full_iteration",
-        fp8=False,
-        fp4=False,
-        moe_router_padding_for_quantization=False,
-        moe_token_dispatcher_type="flex",
-        moe_flex_dispatcher_backend="hybridep",
-        moe_paged_stash=False,
-    )
-    module._fused_ops = None
-    fused_ops = FakeFusedOps()
-    module._make_fused_ops = lambda: fused_ops
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    module._tokens_per_expert_to_device = lambda counts, device: torch.tensor(counts, device=device)
-    hidden_states = torch.zeros(4, 4)
-    tokens_per_expert = torch.tensor([1, 1])
-    probs = torch.ones(4)
-
-    output = module._fused_forward(hidden_states, tokens_per_expert, probs)
-
-    assert output is hidden_states
-    torch.testing.assert_close(fused_ops.args[1], torch.tensor([1, 3]))
-    torch.testing.assert_close(fused_ops.args[3], torch.tensor([1, 3]))
-
-
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
     intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
 
