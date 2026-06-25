@@ -4,7 +4,6 @@
 
 import gc
 import logging
-import os
 from contextlib import contextmanager
 
 import torch
@@ -18,11 +17,6 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
-
-
-def _env_flag(name):
-    """Return True when an environment flag is set to a truthy value."""
-    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
 def _synchronize_fsdp_param_gathers(model):
@@ -84,24 +78,6 @@ def get_graph_pool(use_single_mempool):
     return torch.cuda.graph_pool_handle()
 
 
-def _require_pytorch_stale_stream_fix():
-    """Require PyTorch's stale stream override for full-iteration graph capture."""
-    if not _env_flag("MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX"):
-        raise RuntimeError(
-            "MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX=1 must be set when using "
-            "full-iteration CUDA graph capture."
-        )
-
-    graph_api = getattr(torch.autograd, "graph", None)
-    setter = getattr(graph_api, "set_override_stale_capture_stream", None)
-    if setter is None:
-        raise RuntimeError(
-            "MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX=1 was requested, "
-            "but this PyTorch build does not provide "
-            "torch.autograd.graph.set_override_stale_capture_stream."
-        )
-
-
 @contextmanager
 def _override_stale_capture_stream():
     """Temporarily enable PyTorch's stale stream override."""
@@ -109,8 +85,7 @@ def _override_stale_capture_stream():
     setter = getattr(graph_api, "set_override_stale_capture_stream", None)
     if setter is None:
         raise RuntimeError(
-            "MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX=1 was requested, "
-            "but this PyTorch build does not provide "
+            "Full-iteration CUDA graph capture requires "
             "torch.autograd.graph.set_override_stale_capture_stream."
         )
 
@@ -220,7 +195,6 @@ class FullCudaGraphWrapper:
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
-        _require_pytorch_stale_stream_fix()
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
