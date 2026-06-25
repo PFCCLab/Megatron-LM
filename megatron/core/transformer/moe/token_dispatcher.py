@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     hybrid_ep_combine,
     hybrid_ep_dispatch,
     set_deepep_num_sms,
+    trim_hybridep_static_budget_padding,
 )
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
@@ -1127,8 +1128,8 @@ class _HybridEPManager(_DispatchManager):
         elif self.config.cuda_graph_impl == "full_iteration":
             # Full-iteration CUDA graph capture cannot safely use HybridEP's dynamic
             # permuted-token sizing path because it reads a GPU-produced size back to host.
-            # Use the same static-budget shape as capacity-factor mode, without requiring
-            # the TE op-fuser that is incompatible with fine-grained activation offload.
+            # Use a static budget even when rank capacity factor is unset, so the dispatch
+            # buffer shape is graph-stable without depending on capacity-factor mode.
             pad_multiple = get_align_size_for_quantization(self.config)
             budget = int(padded_num_tokens * self.config.moe_router_topk * 1.2)
             budget += -budget % pad_multiple
@@ -1188,13 +1189,12 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
         )
-        if self.dispatched_probs.shape[0] != dispatched_hidden.shape[0]:
-            if self.dispatched_probs.shape[0] < dispatched_hidden.shape[0]:
-                raise RuntimeError(
-                    "HybridEP returned fewer dispatched probs than hidden states: "
-                    f"{self.dispatched_probs.shape[0]} < {dispatched_hidden.shape[0]}"
-                )
-            self.dispatched_probs = self.dispatched_probs[: dispatched_hidden.shape[0]]
+        self.dispatched_probs = trim_hybridep_static_budget_padding(
+            self.dispatched_probs,
+            dispatched_hidden.shape[0],
+            tensor_name="dispatched prob",
+            target_name="hidden state",
+        )
         if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
@@ -1207,6 +1207,8 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
+        # Static-budget paths already have num_permuted_tokens, but experts still need
+        # the actual per-expert counts returned by HybridEP to partition dispatched rows.
         if (
             self.moe_expert_rank_capacity_factor is not None
             or self.config.cuda_graph_impl == "full_iteration"
@@ -1238,6 +1240,7 @@ class _HybridEPManager(_DispatchManager):
         # num_dispatched_tokens, because their values never change.
         is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
         if is_current_stream_capturing is not None and is_current_stream_capturing():
+            # Captured graph replays may still reference backend resources stored in the handle.
             self._cuda_graph_handles.append(self.handle)
         self.handle = None
         if not self.drop_and_pad:

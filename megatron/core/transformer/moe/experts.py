@@ -608,6 +608,21 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        is_hybridep_full_cg = (
+            getattr(self.config, "cuda_graph_impl", "none") == "full_iteration"
+            and getattr(self.config, "moe_token_dispatcher_type", None) == "flex"
+            and getattr(self.config, "moe_flex_dispatcher_backend", None) == "hybridep"
+        )
+        if is_hybridep_full_cg:
+            tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+            tokens_per_expert = self._tokens_per_expert_to_device(
+                tokens_per_expert, permuted_local_hidden_states.device
+            )
+
+        # HybridEP full-CG may size probabilities to the static dispatch budget; trim them
+        # before the fused MLP consumes the dispatched hidden rows.
         permuted_probs = self._align_hybridep_static_budget_probs(
             permuted_local_hidden_states, permuted_probs
         )
@@ -677,7 +692,12 @@ class TEGroupedMLP(MegatronModule):
     def _align_hybridep_static_budget_probs(
         self, permuted_local_hidden_states: torch.Tensor, permuted_probs: torch.Tensor
     ) -> torch.Tensor:
-        """Trim HybridEP static-budget probability padding to the dispatched token rows."""
+        """Trim HybridEP static-budget probability padding to the rows consumed by GroupedLinear.
+
+        HybridEP full-CG dispatch uses a fixed token budget for stable graph shapes, so router
+        probabilities can include extra budget rows while the expert MLP only consumes the
+        dispatched hidden rows. Keep both tensors row-aligned before applying token weights.
+        """
         if (
             permuted_probs is None
             or permuted_probs.shape[0] == permuted_local_hidden_states.shape[0]
@@ -782,6 +802,7 @@ class TEGroupedMLP(MegatronModule):
         tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
             permuted_local_hidden_states, tokens_per_expert
         )
+        # Keep router probabilities row-aligned with the padded GroupedLinear input.
         permuted_probs = self._align_hybridep_static_budget_probs(
             permuted_local_hidden_states, permuted_probs
         )
@@ -819,6 +840,7 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
+        # Re-align after FC1 because the output row count is the source of truth for weighting.
         permuted_probs = self._align_hybridep_static_budget_probs(fc1_output, permuted_probs)
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):

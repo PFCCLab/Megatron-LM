@@ -48,6 +48,20 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
     return x.size(1) * max(x.element_size(), 2)
 
 
+def trim_hybridep_static_budget_padding(
+    tensor: torch.Tensor, target_num_rows: int, *, tensor_name: str, target_name: str
+) -> torch.Tensor:
+    """Trim static-budget padding rows while preserving the required row contract."""
+    if tensor.shape[0] == target_num_rows:
+        return tensor
+    if tensor.shape[0] < target_num_rows:
+        raise RuntimeError(
+            f"HybridEP returned fewer {tensor_name} rows than {target_name}: "
+            f"{tensor.shape[0]} < {target_num_rows}"
+        )
+    return tensor[:target_num_rows]
+
+
 def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     """Get or create a buffer for all-to-all communication.
 
@@ -734,13 +748,12 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens=ctx.num_permuted_tokens,
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
-        if dispatched_hidden.shape[0] != ctx.input_num_tokens:
-            if dispatched_hidden.shape[0] < ctx.input_num_tokens:
-                raise RuntimeError(
-                    "HybridEP combine backward returned fewer rows than the combine input: "
-                    f"{dispatched_hidden.shape[0]} < {ctx.input_num_tokens}"
-                )
-            dispatched_hidden = dispatched_hidden[: ctx.input_num_tokens]
+        dispatched_hidden = trim_hybridep_static_budget_padding(
+            dispatched_hidden,
+            ctx.input_num_tokens,
+            tensor_name="combine-backward dispatched hidden",
+            target_name="the combine input",
+        )
         return dispatched_hidden, None, None, None, None
 
 
