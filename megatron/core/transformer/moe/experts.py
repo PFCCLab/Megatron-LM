@@ -622,8 +622,8 @@ class TEGroupedMLP(MegatronModule):
             )
             tokens_per_expert_needs_device_copy = True
 
-        # HybridEP full-CG may size probabilities to the static dispatch budget; trim them
-        # before the fused MLP consumes the dispatched hidden rows.
+        # Enforce row alignment before weighting. Only HybridEP full-CG may trim extra
+        # static-budget probability rows; other mismatches are treated as errors.
         permuted_probs = self._align_hybridep_static_budget_probs(
             permuted_local_hidden_states, permuted_probs
         )
@@ -695,11 +695,10 @@ class TEGroupedMLP(MegatronModule):
     def _align_hybridep_static_budget_probs(
         self, permuted_local_hidden_states: torch.Tensor, permuted_probs: torch.Tensor
     ) -> torch.Tensor:
-        """Trim HybridEP static-budget probability padding to the rows consumed by GroupedLinear.
+        """Ensure probability rows match the rows consumed by GroupedLinear.
 
-        HybridEP full-CG dispatch uses a fixed token budget for stable graph shapes, so router
-        probabilities can include extra budget rows while the expert MLP only consumes the
-        dispatched hidden rows. Keep both tensors row-aligned before applying token weights.
+        Most paths should already be aligned. HybridEP full-CG is the one path allowed to
+        trim extra static-budget probability rows; every other mismatch is an error.
         """
         if (
             permuted_probs is None
@@ -805,7 +804,8 @@ class TEGroupedMLP(MegatronModule):
         tokens_per_expert = self._pad_hybridep_static_budget_tokens_per_expert(
             permuted_local_hidden_states, tokens_per_expert
         )
-        # Keep router probabilities row-aligned with the padded GroupedLinear input.
+        # Enforce row alignment before weighting. Only HybridEP full-CG may trim extra
+        # static-budget probability rows; other mismatches are treated as errors.
         permuted_probs = self._align_hybridep_static_budget_probs(
             permuted_local_hidden_states, permuted_probs
         )
@@ -843,7 +843,7 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
-        # Re-align after FC1 because the output row count is the source of truth for weighting.
+        # Re-check after FC1 because its output row count is the source of truth for weighting.
         permuted_probs = self._align_hybridep_static_budget_probs(fc1_output, permuted_probs)
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
