@@ -307,9 +307,18 @@ class MLP(MegatronModule):
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
+            # 【修复的问题描述】：MoE expert 内 SwiGLU 与 router prob 相乘的计算精度对齐。
+            # PaddleFleet 的 `fused_swiglu_scale` CUDA kernel 在 fp32 下完成 SwiGLU
+            # 激活并乘上 per_token_scale（router prob），最后一次性 round 回 bf16；
+            # 而 Megatron 原实现是 bf16 SwiGLU + bf16 乘 prob，存在两次 bf16 round，
+            # 与 PF 末位有 diff。这里在存在 per_token_scale 时把 GLU 提升到 fp32 计算，
+            # 配合下方 fp32 乘 prob 后再 cast 回 bf16，对齐 PF 单次 round 的语义。
+            _glu_fp32 = per_token_scale is not None
             if self.config.gated_linear_unit:
 
                 def glu(x):
+                    if _glu_fp32:
+                        x = x.to(torch.float32)
                     x_glu, x_linear = torch.chunk(x, 2, dim=-1)
                     if (val := self.config.activation_func_clamp_value) is not None:
                         x_glu = x_glu.clamp(min=None, max=val)
@@ -320,12 +329,27 @@ class MLP(MegatronModule):
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                # 【修复的问题描述】：MoE expert 内 SwiGLU 与 router prob 相乘的计算精度对齐。
+                # 非 GLU 分支同样在存在 per_token_scale 时把激活提升到 fp32 计算，
+                # 保持与 PaddleFleet fused_swiglu_scale 一致的单次 round 路径。
+                if _glu_fp32:
+                    intermediate_parallel = self.activation_func(
+                        intermediate_parallel.to(torch.float32)
+                    )
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
 
             if per_token_scale is not None:
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                # 【修复的问题描述】：MoE expert 内 SwiGLU 与 router prob 相乘的计算精度对齐。
+                # GLU 已在 fp32 下计算，这里把 per_token_scale 也 cast 到 fp32 相乘，
+                # 最后一次性 cast 回原始 bf16 dtype，对齐 PaddleFleet fused_swiglu_scale
+                # 「fp32 激活 × fp32 prob → 单次 bf16 round」的数值路径。
+                original_dtype = hidden_states.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1).to(
+                    intermediate_parallel.dtype
+                )
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+
         nvtx_range_pop(suffix="activation")
 
         # [s, b, h]
