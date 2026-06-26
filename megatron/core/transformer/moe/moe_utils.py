@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -50,6 +51,29 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+
+
+def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 把 permuted_tokens 提升到 fp32 后用 scatter_add_ 累加，再 cast 回原 dtype，
+    # 单次 round，复刻 PF 侧确定性 fp32 累加路径。
+    if len(restore_shape) != 2:
+        return None
+
+    hidden = int(restore_shape[-1])
+    output_tokens = torch.zeros(
+        restore_shape,
+        dtype=torch.float32,
+        device=permuted_tokens.device,
+    )
+    output_tokens.scatter_add_(
+        0,
+        sorted_indices.unsqueeze(1).expand(-1, hidden),
+        permuted_tokens.to(torch.float32),
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
 
 
 # MOE logging
@@ -482,6 +506,17 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 在 unpermute（无 probs、非 drop_and_pad）的标准路径上改走 fp32 累加。
+    if (
+        probs is None
+        and not drop_and_pad
+    ):
+        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        if fp32_output is not None:
+            return fp32_output
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
