@@ -80,14 +80,14 @@ def get_graph_pool(use_single_mempool):
 
 @contextmanager
 def _override_stale_capture_stream():
-    """Temporarily enable PyTorch's stale stream override."""
+    """Temporarily enable PyTorch's stale stream override when available."""
     graph_api = getattr(torch.autograd, "graph", None)
     setter = getattr(graph_api, "set_override_stale_capture_stream", None)
     if setter is None:
-        raise RuntimeError(
-            "Full-iteration CUDA graph capture requires "
-            "torch.autograd.graph.set_override_stale_capture_stream."
-        )
+        # Older PyTorch builds used by some CI jobs do not expose this API.
+        # Keep the previous full-CG capture behavior on those builds.
+        yield
+        return
 
     getter = getattr(torch._C, "_get_override_stale_capture_stream", None)
     if getter is None:
