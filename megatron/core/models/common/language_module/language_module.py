@@ -34,6 +34,15 @@ from megatron.core.utils import (
 )
 
 
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
 
@@ -143,7 +152,12 @@ class LanguageModule(MegatronModule):
         # 在 TP=1 场景下其内部累加顺序与 paddle `nn.CrossEntropyLoss` / `F.cross_entropy`
         # 不一致，导致两框架 LM loss 末位存在 diff。此处在 TP=1 且 logits 未做 vocab 切分
         # 时切换到 `torch.nn.functional.cross_entropy`，与 Paddle 侧 CE 路径对齐。
-        if parallel_state.get_tensor_model_parallel_world_size() == 1 and logits.ndim == 3:
+        # 由 use_accuracy_compatible 控制：关闭时走原始 vocab_parallel_cross_entropy / fusion 路径。
+        if (
+            _use_accuracy_compatible()
+            and parallel_state.get_tensor_model_parallel_world_size() == 1
+            and logits.ndim == 3
+        ):
             loss = F.cross_entropy(
                 logits.float().reshape(-1, logits.shape[-1]),
                 labels.reshape(-1),

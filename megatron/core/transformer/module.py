@@ -57,6 +57,17 @@ def _restore_expert_bias_fp32(module, snapshots):
     return restored
 
 
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    import os
+
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
 def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
 
@@ -469,7 +480,8 @@ class Float16Module(MegatronModule):
         self.pg_collection = getattr(module, 'pg_collection', None)
 
         expert_bias_snapshots = {}
-        if self.fp16 or self.bf16:
+        _accuracy_compatible = _use_accuracy_compatible()
+        if _accuracy_compatible and (self.fp16 or self.bf16):
             expert_bias_snapshots = _snapshot_expert_bias_fp32(module)
 
         if self.fp16:
@@ -490,7 +502,7 @@ class Float16Module(MegatronModule):
         if expert_bias_snapshots:
             _restore_expert_bias_fp32(self.module, expert_bias_snapshots)
 
-        if getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0:
+        if _accuracy_compatible and getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0:
             config.moe_router_bias_update_rate = 0.0
 
         self.float16_convertor = float16_convertor
