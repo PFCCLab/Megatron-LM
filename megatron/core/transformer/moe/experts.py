@@ -1162,6 +1162,38 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
 
 
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    import os
+
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
+class _SeqMLPProxy:
+    """Expose GroupedMLP-compatible ``weight{i}`` / ``bias{i}`` access on top of
+    ``SequentialMLP.local_experts[i].linear_fc{1,2}``.
+
+    Required by upper layers (e.g. ms-swift's ``GPTBridge._set_mlp_state``) that
+    probe ``mg_mlp.linear_fc1`` / ``linear_fc2`` like GroupedMLP.
+    """
+    def __init__(self, experts, attr):
+        self._experts = experts
+        self._attr = attr
+
+    def __getattr__(self, name):
+        if name.startswith('weight'):
+            idx = int(name[len('weight'):])
+            return getattr(self._experts[idx], self._attr).weight
+        if name.startswith('bias'):
+            idx = int(name[len('bias'):])
+            return getattr(self._experts[idx], self._attr).bias
+        raise AttributeError(name)
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
@@ -1205,6 +1237,16 @@ class SequentialMLP(MegatronModule):
                 name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
+
+        # ---- alignment patch: expose GroupedMLP-style interfaces on SequentialMLP ----
+        # Upper layers (e.g. ms-swift gpt_bridge._set_mlp_state) probe
+        # `mg_mlp.linear_fc1` / `linear_fc2` and expect `weight{i}`/`bias{i}` access
+        # like GroupedMLP. Inject a thin proxy that forwards to local_experts[i].
+        # Gated by use_accuracy_compatible; otherwise SequentialMLP keeps its original
+        # interface (no linear_fc1/linear_fc2 attributes).
+        if _use_accuracy_compatible():
+            self.linear_fc1 = _SeqMLPProxy(self.local_experts, 'linear_fc1')
+            self.linear_fc2 = _SeqMLPProxy(self.local_experts, 'linear_fc2')
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""

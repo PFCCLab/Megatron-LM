@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -52,6 +53,39 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
 
+def _use_accuracy_compatible() -> bool:
+    """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
+
+    Driven by ms-swift's ``use_accuracy_compatible`` arg via the ``USE_ACCURACY_COMPATIBLE``
+    env var. Defaults to False so that unpatched usage keeps the original Megatron logic.
+    """
+    return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
+
+
+def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 把 permuted_tokens 提升到 fp32 后用 scatter_add_ 累加，再 cast 回原 dtype，
+    # 单次 round，复刻 PF 侧确定性 fp32 累加路径。
+    if len(restore_shape) != 2:
+        return None
+
+    hidden = int(restore_shape[-1])
+    output_tokens = torch.zeros(
+        restore_shape,
+        dtype=torch.float32,
+        device=permuted_tokens.device,
+    )
+    output_tokens.scatter_add_(
+        0,
+        sorted_indices.unsqueeze(1).expand(-1, hidden),
+        permuted_tokens.to(torch.float32),
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
+
+
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -483,6 +517,19 @@ def unpermute(
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
+
+    # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
+    # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
+    # 在 unpermute（无 probs、非 drop_and_pad）的标准路径上改走 fp32 累加。
+    # 由 use_accuracy_compatible 控制，关闭时保留原始 scatter_add_ 路径。
+    if (
+        _use_accuracy_compatible()
+        and probs is None
+        and not drop_and_pad
+    ):
+        fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
+        if fp32_output is not None:
+            return fp32_output
 
     if probs is not None:
         assert routing_map is not None, "Mask must be provided to permute the probs."
@@ -1266,7 +1313,15 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        # 禁用 router TE GEMM，强制走 torch.mm 以对齐 PaddleFleet。
+        # te_general_gemm 在 fp32 router_dtype 下与 PF 的 matmul 选不同 cuBLAS 算法，
+        # 导致 gate_logits 末位 diff，叠加 topk 离散选择后 router_output_0/1 翻转。
+        # 由 use_accuracy_compatible 控制：关闭时保留原始 TE GEMM 路径。
+        if (
+            not _use_accuracy_compatible()
+            and te_general_gemm is not None
+            and router_dtype != torch.float64
+        ):
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1299,7 +1354,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        # 禁用 TE GEMM 以对齐 PF 精度
+        # 由 use_accuracy_compatible 控制：关闭时保留原始 TE GEMM 路径。
+        if (
+            not _use_accuracy_compatible()
+            and te_general_gemm is not None
+            and ctx.router_dtype != torch.float64
+        ):
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
