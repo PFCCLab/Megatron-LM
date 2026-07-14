@@ -569,7 +569,16 @@ def _get_megatron_optimizer_based_on_param_groups(
                 if is_te_min_version("2.1.0.dev0"):
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
 
-            optimizer = adam_cls(**kwargs)
+            # [对齐修复] use_accuracy_compatible=1 时强制 torch.optim.AdamW(fused=True), 与
+            # PaddleFleet `paddle.optimizer.AdamW` 公式逐位对齐, 绕开 TE.FusedAdam / apex.FusedAdam
+            # 在 bias correction 顺序 / weight decay 时机 / eps 位置上的差异。
+            # 仅在非 precision_aware_optimizer 分支启用, 避免触碰 TE 特有 kwargs。
+            from ..transformer.module import _use_accuracy_compatible
+            if _use_accuracy_compatible() and not config.use_precision_aware_optimizer:
+                kwargs["fused"] = True
+                optimizer = torch.optim.AdamW(**kwargs)
+            else:
+                optimizer = adam_cls(**kwargs)
 
             def init_state_fn(opt, config=None):
                 for group in opt.param_groups:
