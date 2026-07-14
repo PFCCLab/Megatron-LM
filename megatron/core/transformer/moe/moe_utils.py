@@ -84,6 +84,45 @@ def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.T
     return output_tokens.to(dtype=permuted_tokens.dtype)
 
 
+class _Fp32BackwardIndexSelect(torch.autograd.Function):
+    """permute 阶段 `index_select` 的 fp32 反向累积实现。
+
+    forward 与原生 `tokens.index_select(0, sorted_indices)` 完全一致。
+    backward 时，多个 permuted 行会回写到同一个原始 token 行（一个 token 被
+    topk 个 expert 选中），原生 index_select 的 backward 走 bf16 `index_add`/
+    `scatter_add`，atomic 累加顺序不可复现，与 PaddleFleet 末位 diff。
+    这里把 grad 提升到 fp32 后 scatter_add 累加，再 cast 回原 dtype，单次 round，
+    复刻 PF 侧确定性 fp32 累加路径。
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, sorted_indices):
+        ctx.save_for_backward(sorted_indices)
+        ctx.num_tokens = tokens.shape[0]
+        ctx.hidden = tokens.shape[1]
+        ctx.input_dtype = tokens.dtype
+        return tokens.index_select(0, sorted_indices)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (sorted_indices,) = ctx.saved_tensors
+        grad_tokens = torch.zeros(
+            (ctx.num_tokens, ctx.hidden),
+            dtype=torch.float32,
+            device=grad_output.device,
+        )
+        grad_tokens.scatter_add_(
+            0,
+            sorted_indices.unsqueeze(1).expand(-1, ctx.hidden),
+            grad_output.to(torch.float32),
+        )
+        return grad_tokens.to(dtype=ctx.input_dtype), None
+
+
+def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tensor):
+    return _Fp32BackwardIndexSelect.apply(tokens, sorted_indices)
+
+
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
 
@@ -458,7 +497,11 @@ def permute(
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
     # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    if _use_accuracy_compatible() and not drop_and_pad:
+        # fp32 确定性反向累积，复刻 PF 侧 permute backward
+        permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
 
