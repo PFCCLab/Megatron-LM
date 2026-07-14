@@ -3,6 +3,7 @@
 from functools import partial
 from typing import Callable, List, Optional, Union
 
+import os
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -478,7 +479,11 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        _update_router_expert_bias(model, config)
+        # [对齐修复] use_accuracy_compatible=1 时冻结 expert_bias 更新,
+        # 因为 PaddleFormers 尚未实现该 buffer 的 step 间更新逻辑,
+        # 保留前向加 bias 但跳过 all_reduce + update 保证 step2 前向对齐。
+        if not _use_accuracy_compatible():
+            _update_router_expert_bias(model, config)
 
     reset_model_temporary_tensors(config, model)
 
