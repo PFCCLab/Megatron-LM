@@ -575,6 +575,10 @@ def _get_megatron_optimizer_based_on_param_groups(
             # 仅在非 precision_aware_optimizer 分支启用, 避免触碰 TE 特有 kwargs。
             from ..transformer.module import _use_accuracy_compatible
             if _use_accuracy_compatible() and not config.use_precision_aware_optimizer:
+                # torch.optim.AdamW 无 adam_w_mode 形参（AdamW 即 decoupled weight
+                # decay）；若上游 TE/Apex 分支已注入该 kwarg，这里必须剔除，否则
+                # torch.optim.AdamW 会抛 unexpected keyword argument。
+                kwargs.pop("adam_w_mode", None)
                 kwargs["fused"] = True
                 optimizer = torch.optim.AdamW(**kwargs)
             else:

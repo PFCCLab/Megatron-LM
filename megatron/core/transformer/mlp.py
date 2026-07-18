@@ -130,6 +130,37 @@ class LinearFc2Builder(Protocol):
         ...
 
 
+class _WeightedScaleFp64ProbsGrad(torch.autograd.Function):
+    """weighted-scale ``x * probs``（x 为 fp32 SwiGLU 输出，probs 为 [tokens,1]）。
+
+    前向数值与普通乘法一致，``dL/dx`` 仍按原 fp32 逐元素（保证 expert/fc1 wgrad 不变）。
+    反向的 ``dL/dprobs`` 用 **fp64 从 fc1 输出 o1 重算 silu(gate)·val** 再 Σ_ffn(·grad)：
+    - fp64 silu 消除 paddle/torch fp32 silu 的末位差（实测 Ssilu 差 ~5.7e-7）；
+    - fp64 reduction 消除 ffn 维累加顺序差；
+    与 PF 侧 fp64 probs_grad 完全一致（gate/router wgrad 分叉根因，known-diffs 5.6 思路）。"""
+
+    @staticmethod
+    def forward(ctx, x, probs, o1, glu_offset, clamp_val):
+        ctx.save_for_backward(x, probs, o1)
+        ctx.glu_offset = float(glu_offset)
+        ctx.clamp_val = clamp_val
+        return x * probs
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, probs, o1 = ctx.saved_tensors
+        grad_x = grad_out * probs
+        xf = o1.double()
+        x_glu, x_linear = torch.chunk(xf, 2, dim=-1)
+        if ctx.clamp_val is not None:
+            x_glu = x_glu.clamp(min=None, max=ctx.clamp_val)
+            x_linear = x_linear.clamp(min=-ctx.clamp_val, max=ctx.clamp_val)
+        sv64 = F.silu(x_glu) * (x_linear + ctx.glu_offset)
+        gf = grad_out.double()
+        grad_probs = (sv64 * gf).sum(dim=-1, keepdim=True).to(probs.dtype)
+        return grad_x, grad_probs, None, None, None
+
+
 @dataclass
 class MLPSubmodules:
     """
@@ -328,8 +359,11 @@ class MLP(MegatronModule):
                         x_linear + self.config.glu_linear_offset
                     )
 
+                # 保存 fc1 输出 o1（bf16），供下方 fp64 probs_grad 从 o1 重算 silu·val。
+                _o1_ref = intermediate_parallel
                 intermediate_parallel = glu(intermediate_parallel)
             else:
+                _o1_ref = None
                 # 【修复的问题描述】：MoE expert 内 SwiGLU 与 router prob 相乘的计算精度对齐。
                 # 非 GLU 分支同样在存在 per_token_scale 时把激活提升到 fp32 计算，
                 # 保持与 PaddleFleet fused_swiglu_scale 一致的单次 round 路径。
@@ -347,9 +381,21 @@ class MLP(MegatronModule):
                     # 最后一次性 cast 回原始 bf16 dtype，对齐 PaddleFleet fused_swiglu_scale
                     # 「fp32 激活 × fp32 prob → 单次 bf16 round」的数值路径。
                     original_dtype = hidden_states.dtype
-                    intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1).to(
-                        intermediate_parallel.dtype
-                    )
+                    # dL/d(per_token_scale) 用 fp64 从 fc1 输出 o1 重算 silu·val 再 Σ_ffn(·grad)，
+                    # 对齐 PF fp64 probs_grad（gate wgrad 分叉根因）。前向数值不变、dL/d(act)
+                    # 仍 fp32 → expert/fc1 wgrad 不变。
+                    if _o1_ref is not None:
+                        intermediate_parallel = _WeightedScaleFp64ProbsGrad.apply(
+                            intermediate_parallel,
+                            per_token_scale.unsqueeze(-1).to(intermediate_parallel.dtype),
+                            _o1_ref.detach(),
+                            self.config.glu_linear_offset,
+                            self.config.activation_func_clamp_value,
+                        )
+                    else:
+                        intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(
+                            -1
+                        ).to(intermediate_parallel.dtype)
                     intermediate_parallel = intermediate_parallel.to(original_dtype)
                 else:
                     # 原始路径：bf16 SwiGLU 输出直接乘 bf16 prob。
