@@ -74,7 +74,7 @@ except ImportError:
     if TYPE_CHECKING:
         # For type checking, treat transformer_engine as always available.
         import transformer_engine as te
-        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
         HAVE_TE = True
     else:
