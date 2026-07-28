@@ -663,10 +663,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
-        assert (
-            isinstance(optimizer, (Adam, torch.optim.AdamW, HybridDeviceOptimizer))
-            or optimizer is None
-        ), (
+        from megatron.core.transformer.module import _use_accuracy_compatible
+
+        _allowed_optim_types = (Adam, HybridDeviceOptimizer)
+        if _use_accuracy_compatible():
+            _allowed_optim_types = (Adam, torch.optim.AdamW, HybridDeviceOptimizer)
+        assert isinstance(optimizer, _allowed_optim_types) or optimizer is None, (
             "Only Adam and HybridDeviceOptimizer currently supported, "
             "due to checkpointing requirements."
         )

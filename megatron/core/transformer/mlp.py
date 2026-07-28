@@ -23,8 +23,8 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import cat_with_oom_fallback, sharded_state_dict_default
 from megatron.core.typed_torch import apply_module, not_none
@@ -140,6 +140,7 @@ class _WeightedScaleFp64ProbsGrad(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, probs, o1, glu_offset, clamp_val):
+        """Forward: element-wise x * probs."""
         ctx.save_for_backward(x, probs, o1)
         ctx.glu_offset = float(glu_offset)
         ctx.clamp_val = clamp_val
@@ -147,6 +148,7 @@ class _WeightedScaleFp64ProbsGrad(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
+        """Backward: fp64 reduction for probs grad."""
         x, probs, o1 = ctx.saved_tensors
         grad_x = grad_out * probs
         xf = o1.double()

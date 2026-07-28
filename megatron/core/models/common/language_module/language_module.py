@@ -206,9 +206,19 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(
-                logits, labels, tp_group=self.tp_group
-            )
+            if _use_accuracy_compatible():
+                s, b = labels.shape
+                loss = torch.nn.functional.cross_entropy(
+                    logits.float().reshape(s * b, -1),  # [s*b, vocab]
+                    labels.reshape(s * b),  # [s*b]
+                    reduction='none',
+                ).reshape(
+                    s, b
+                )  # [s, b]
+            else:
+                loss = tensor_parallel.vocab_parallel_cross_entropy(
+                    logits, labels, tp_group=self.tp_group
+                )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()

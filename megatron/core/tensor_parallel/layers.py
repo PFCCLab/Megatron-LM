@@ -298,11 +298,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        if self.deterministic_mode:
+        from megatron.core.transformer.module import _use_accuracy_compatible
+
+        if _use_accuracy_compatible():
             output_parallel = self.weight[masked_input]
         else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            if self.deterministic_mode:
+                output_parallel = self.weight[masked_input]
+            else:
+                # F.embedding currently has a non-deterministic backward function
+                output_parallel = F.embedding(masked_input, self.weight)
         # Mask the output embedding.
         if self.tp_group.size() > 1:
             output_parallel[input_mask, :] = 0.0
