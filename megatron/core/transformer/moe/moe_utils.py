@@ -53,6 +53,7 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
 
+
 def _use_accuracy_compatible() -> bool:
     """Runtime switch for the PaddleFleet<->Megatron bit-alignment patches.
 
@@ -62,7 +63,9 @@ def _use_accuracy_compatible() -> bool:
     return os.environ.get('USE_ACCURACY_COMPATIBLE', '0') == '1'
 
 
-def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape):
+def _fp32_accum_unpermute(
+    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape
+):
     # 【修复的问题描述】：MoE unpermute 阶段 `scatter_add_` 在 bf16 下走 atomic 累加，
     # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
     # 把 permuted_tokens 提升到 fp32 后用 scatter_add_ 累加，再 cast 回原 dtype，
@@ -71,15 +74,9 @@ def _fp32_accum_unpermute(permuted_tokens: torch.Tensor, sorted_indices: torch.T
         return None
 
     hidden = int(restore_shape[-1])
-    output_tokens = torch.zeros(
-        restore_shape,
-        dtype=torch.float32,
-        device=permuted_tokens.device,
-    )
+    output_tokens = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
     output_tokens.scatter_add_(
-        0,
-        sorted_indices.unsqueeze(1).expand(-1, hidden),
-        permuted_tokens.to(torch.float32),
+        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens.to(torch.float32)
     )
     return output_tokens.to(dtype=permuted_tokens.dtype)
 
@@ -107,14 +104,10 @@ class _Fp32BackwardIndexSelect(torch.autograd.Function):
     def backward(ctx, grad_output):
         (sorted_indices,) = ctx.saved_tensors
         grad_tokens = torch.zeros(
-            (ctx.num_tokens, ctx.hidden),
-            dtype=torch.float32,
-            device=grad_output.device,
+            (ctx.num_tokens, ctx.hidden), dtype=torch.float32, device=grad_output.device
         )
         grad_tokens.scatter_add_(
-            0,
-            sorted_indices.unsqueeze(1).expand(-1, ctx.hidden),
-            grad_output.to(torch.float32),
+            0, sorted_indices.unsqueeze(1).expand(-1, ctx.hidden), grad_output.to(torch.float32)
         )
         return grad_tokens.to(dtype=ctx.input_dtype), None
 
@@ -125,6 +118,7 @@ def _fp32_backward_index_select(tokens: torch.Tensor, sorted_indices: torch.Tens
 
 # MOE logging
 _MOE_LAYER_WISE_LOGGING_TRACKER: dict = {}
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -565,11 +559,7 @@ def unpermute(
     # 多 expert 输出回写到同一 token 行时累加顺序不可复现，与 PaddleFleet 末位 diff。
     # 在 unpermute（无 probs、非 drop_and_pad）的标准路径上改走 fp32 累加。
     # 由 use_accuracy_compatible 控制，关闭时保留原始 scatter_add_ 路径。
-    if (
-        _use_accuracy_compatible()
-        and probs is None
-        and not drop_and_pad
-    ):
+    if _use_accuracy_compatible() and probs is None and not drop_and_pad:
         fp32_output = _fp32_accum_unpermute(permuted_tokens, sorted_indices, restore_shape)
         if fp32_output is not None:
             return fp32_output
@@ -888,17 +878,33 @@ def topk_routing_with_score_function(
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32)
     elif score_function in ("sigmoid", "sqrtsoftplus"):
-        if score_function == "sigmoid":
-            scores = torch.sigmoid(logits.float())
+        if _use_accuracy_compatible():
+            if score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float()).type_as(logits)
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
+            if expert_bias is not None:
+                scores_for_routing = scores + expert_bias
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+                scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+            else:
+                scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            _scores_f64 = scores.double()
+            _sum_f64 = _scores_f64.sum(dim=-1, keepdim=True)
+            _denom = _sum_f64.float() + 1e-20
+            probs = scores / _denom if topk > 1 else scores
         else:
-            scores = torch.nn.functional.softplus(logits.float()).sqrt()
-        if expert_bias is not None:
-            scores_for_routing = scores + expert_bias.float()
-            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-            scores = torch.gather(scores, dim=1, index=top_indices)
-        else:
-            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+            if score_function == "sigmoid":
+                scores = torch.sigmoid(logits.float())
+            else:
+                scores = torch.nn.functional.softplus(logits.float()).sqrt()
+            if expert_bias is not None:
+                scores_for_routing = scores + expert_bias.float()
+                _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+                scores = torch.gather(scores, dim=1, index=top_indices)
+            else:
+                scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
