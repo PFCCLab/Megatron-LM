@@ -645,7 +645,8 @@ class MoELayer(BaseMoELayer):
                     # Bit-exact mode keeps router/dispatcher/shared on independent
                     # identity nodes. This is part of the numerical graph, not a
                     # logging probe: removing the nodes changes bf16 gradient sum
-                    # order at the shared input. GLM_ALIGN_LOG must only add hooks.
+                    # order at the shared input, and makes the router input grad a
+                    # 3-way accumulated value that PF's ThreePathCloneAlignMG splits.
                     if _use_accuracy_compatible() and hidden_states.requires_grad:
                         _hs_router_path_mg = hidden_states.clone()
                         _hs_dispatcher_path_mg = hidden_states.clone()
