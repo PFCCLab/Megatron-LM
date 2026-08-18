@@ -24,7 +24,7 @@ upload_path=/workspace/upload
 python -m pip config --user set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 python -m pip config --user set global.trusted-host pypi.tuna.tsinghua.edu.cn
 
-swift_tar (){
+megatron_tar (){
     cd /workspace
     # Megatron-LM.tar only include the main branch
     if [ -n "$BRANCH" ] && [ "$BRANCH" = "main" ]; then
@@ -36,18 +36,19 @@ swift_tar (){
     fi
 }
 
-swift_build (){
+megatron_build (){
     cd $swift_dir
     rm -rf build/
     rm -rf dist/
-    rm -rf ms_swift.egg-info/
+    rm -rf megatron_core.egg-info/
 
-    python -m pip install -r requirements.txt
-    python setup.py bdist_wheel
+    python -m pip install --upgrade pip
+    python -m pip install -r <(python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))")
+    python -m pip install setuptools pybind11 packaging
+    NO_VCS_VERSION=1 python setup.py bdist_wheel
 
     echo "install_megatron_develop_whl"
-    python -m pip install --upgrade pip
-    python -m pip install --ignore-installed dist/megatron-*.whl --no-cache-dir --force-reinstall --no-dependencies
+    python -m pip install --ignore-installed dist/megatron_core-*.whl --no-cache-dir --force-reinstall --no-dependencies
     echo "waiting for import megatron..."
     python -c "import megatron; print('megatron version:', megatron.__version__)"
     python -c "import megatron; print('megatron version:', megatron.__version__)" >> ${log_path}/commit_info.txt
@@ -55,14 +56,14 @@ swift_build (){
     commit=${COMMIT_ID:-unknown}
     commit=${commit:0:7}
 
-    whl_file=$(ls $swift_dir/dist/megatron-*.whl)
+    whl_file=$(ls $swift_dir/dist/megatron_core-*.whl)
     base_name=$(basename $whl_file)
-    new_name=$(echo $base_name | sed "s/\.dev0/&+${commit}/")
+    new_name=$(echo $base_name | sed "s/^\(megatron_core-[0-9.]*\)-/\1+${commit}-/")
     echo "commit whl: $new_name"
     cp "$whl_file" "${upload_path}/${new_name}"
     cp "$whl_file" "${upload_path}/${base_name}"
 
-    zero_name=$(echo $base_name | sed "s/^megatron-[^-]*-/megatron-0.0.0-/")
+    zero_name=$(echo $base_name | sed "s/^megatron_core-[^-]*-/megatron_core-0.0.0-/")
     echo "0.0.0 whl: $zero_name"
     cp "$whl_file" "${upload_path}/${zero_name}"
 }
@@ -70,7 +71,7 @@ swift_build (){
 # main
 cd ${swift_dir}
 echo -e "\033[32m ---- make Megatron-LM.tar.gz  \033[0m"
-swift_tar
+megatron_tar
 echo -e "\033[32m ---- build Megatron-LM whl  \033[0m"
-swift_build
+megatron_build
 
