@@ -99,6 +99,33 @@ jobs:
           conda activate py_\$python_version
           python --version
           DOCKER_EOF
+      - name: Get Whl
+        run: |
+          docker exec -t $container_name /bin/bash -c '
+          . /opt/conda/etc/profile.d/conda.sh
+          conda activate py_$python_version
+          python --version
+          ldconfig
+
+          BOS=https://paddle-github-action.bj.bcebos.com
+          echo "::group::Download paddlefleet / paddlefleet_ops / ms_swift wheels from BOS"
+          cd /workspace
+          for url in \
+            $BOS/PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl \
+            $BOS/PaddleFleet/develop/latest/cu130/paddle-release/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl \
+            $BOS/whl/ms_swift-0.0.0-py3-none-any.whl ; do
+            echo "Downloading $url"
+            wget -q --no-proxy --no-check-certificate --tries=3 --timeout=60 "$url"
+          done
+          ls -l /workspace/
+          echo "::endgroup::"
+
+          echo "::group::Build megatron-core wheel"
+          cd /workspace/Megatron-LM
+          bash scripts/dependence/build.sh
+          echo "::endgroup::"
+          ls -l /workspace/upload/
+          '
       - name: alignment_model_accuracy
         run: |
           docker exec -t $container_name /bin/bash -c '
@@ -106,20 +133,20 @@ jobs:
           conda activate py_$python_version
           python --version
           ldconfig
-          
-          wget -q --no-proxy  https://paddle-github-action.bj.bcebos.com/PaddleFleet/develop/latest/paddlefleet-0.0.0-py3-none-linux_x86_64.whl --no-check-certificate
-          wget -q --no-proxy  https://paddle-github-action.bj.bcebos.com/PaddleFleet/develop/latest/cu130/paddle-release/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl --no-check-certificate
-          wget -q --no-proxy  https://paddle-github-action.bj.bcebos.com/whl/ms_swift-0.0.0-py3-none-any.whl --no-check-certificate
-          cd /workspace/Megatron-LM
-          bash scripts/dependence/build.sh
-          cd -
 
           source $work_dir/../../../proxy
+          # setup_venvs.sh reads PROXY_URL; the proxy file only exports https_proxy.
+          export PROXY_URL="${https_proxy}"
           export PADDLEFLEET_WHEEL_PATH="/workspace/paddlefleet-0.0.0-py3-none-linux_x86_64.whl"
           export PADDLEFLEET_OPS_WHEEL_PATH="/workspace/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl"
-          export MEGATRON_CORE_WHEEL=/workspace/uplo
-          ad/megatron_core-0.0.0-cp312-cp312-linux_x86_64.whl
+          export MEGATRON_CORE_WHEEL=/workspace/upload/megatron_core-0.0.0-cp312-cp312-linux_x86_64.whl
           export MS_SWIFT_WHEEL=/workspace/ms_swift-0.0.0-py3-none-any.whl
+
+          for whl in "$PADDLEFLEET_WHEEL_PATH" "$PADDLEFLEET_OPS_WHEEL_PATH" "$MS_SWIFT_WHEEL" "$MEGATRON_CORE_WHEEL"; do
+            [ -f "$whl" ] || { echo "::error:: missing wheel: $whl"; exit 1; }
+            echo "using $whl"
+          done
+
           bash PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
           bash -x PaddleFleet/scripts/alignment_model_accuracy/run_alignment_test.sh
 
