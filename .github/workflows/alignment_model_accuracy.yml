@@ -123,8 +123,8 @@ jobs:
           echo "::group::Build megatron-core wheel"
           cd /workspace/Megatron-LM
           bash scripts/dependence/build.sh
-          echo "::endgroup::"
           ls -l /workspace/upload/
+          echo "::endgroup::"
           '
       - name: alignment_model_accuracy
         run: |
@@ -135,8 +135,7 @@ jobs:
           ldconfig
 
           source $work_dir/../../../proxy
-          # setup_venvs.sh reads PROXY_URL; the proxy file only exports https_proxy.
-          export PROXY_URL="${https_proxy}"
+          export PROXY_URL="${http_proxy}"
           export PADDLEFLEET_WHEEL_PATH="/workspace/paddlefleet-0.0.0-py3-none-linux_x86_64.whl"
           export PADDLEFLEET_OPS_WHEEL_PATH="/workspace/paddlefleet_ops-0.0.0-cp312-cp312-linux_x86_64.whl"
           export MEGATRON_CORE_WHEEL=/workspace/upload/megatron_core-0.0.0-cp312-cp312-linux_x86_64.whl
@@ -146,7 +145,7 @@ jobs:
             [ -f "$whl" ] || { echo "::error:: missing wheel: $whl"; exit 1; }
             echo "using $whl"
           done
-
+          python -m pip install uv
           bash PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
           bash -x PaddleFleet/scripts/alignment_model_accuracy/run_alignment_test.sh
 
