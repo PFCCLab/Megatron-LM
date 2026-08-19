@@ -65,8 +65,7 @@ jobs:
             wget -q --no-proxy https://paddle-github-action.bj.bcebos.com/whl/Megatron-LM.tar.gz --no-check-certificate
             rm -rf Megatron-LM && tar zxf Megatron-LM.tar.gz && rm -rf Megatron-LM.tar.gz
             cd Megatron-LM
-            git config --global user.name "PaddleCI"
-            git config --global user.email "paddle_ci@example.com"
+            git config --global --add safe.directory /workspace/Megatron-LM
             git pull
             git submodule update --init --recursive --force
             if [ -n "$PR_ID" ] && [ "$PR_ID" != "0" ]; then

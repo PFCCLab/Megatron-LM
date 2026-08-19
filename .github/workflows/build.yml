@@ -55,9 +55,12 @@ jobs:
         run: |
           docker exec -t $container_name /bin/bash -c '
             rm -rf * .[^.]*
+            echo "Download Megatron-LM form https://paddle-github-action.bj.bcebos.com/whl/Megatron-LM.tar.gz"
+            wget -q --no-proxy https://paddle-github-action.bj.bcebos.com/whl/Megatron-LM.tar.gz --no-check-certificate
+            rm -rf Megatron-LM && tar --warning=no-unknown-keyword -zxf Megatron-LM.tar.gz && rm -rf Megatron-LM.tar.gz
             source $work_dir/../../../proxy
-            git clone https://github.com/PFCCLab/Megatron-LM.git
             cd Megatron-LM
+            git pull
             git fetch origin pull/${{ github.event.pull_request.number }}/head:pr-${{ github.event.pull_request.number }}
             git checkout pr-${{ github.event.pull_request.number }}
             git log --pretty=oneline -10
