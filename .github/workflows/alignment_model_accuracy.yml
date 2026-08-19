@@ -4,6 +4,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: Alignment-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   BRANCH: ${{ github.ref_name }}
   COMMIT_ID: ${{ github.sha }}
