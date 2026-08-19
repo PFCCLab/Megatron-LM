@@ -38,21 +38,17 @@ megatron_tar (){
 
 megatron_build (){
     cd $megatron_dir
-    rm -rf build/
+    rm -rf di/
     rm -rf dist/
     rm -rf megatron_core.egg-info/
 
     python -m pip install --upgrade pip
-    python -m pip install -r <(python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))")
-    python -m pip install build setuptools pybind11 packaging
+    python -m pip install build "setuptools>=80" pybind11 packaging
     NO_VCS_VERSION=1 python -m build --wheel --no-isolation
 
     echo "install_megatron_develop_whl"
     python -m pip install --ignore-installed dist/megatron_core-*.whl --no-cache-dir --force-reinstall --no-dependencies
-    echo "waiting for import megatron..."
-    python -c "import megatron; print('megatron version:', megatron.__version__)"
-    python -c "import megatron; print('megatron version:', megatron.__version__)" >> ${log_path}/commit_info.txt
-
+    
     commit=${COMMIT_ID:-unknown}
     commit=${commit:0:7}
 
