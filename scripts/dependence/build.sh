@@ -15,7 +15,7 @@
 # limitations under the License.
 
 set -e
-export swift_dir=/workspace/Megatron-LM
+export megatron_dir=/workspace/Megatron-LM
 mkdir -p /workspace/build_logs
 export log_path=/workspace/build_logs
 mkdir -p /workspace/upload
@@ -37,15 +37,15 @@ megatron_tar (){
 }
 
 megatron_build (){
-    cd $swift_dir
+    cd $megatron_dir
     rm -rf build/
     rm -rf dist/
     rm -rf megatron_core.egg-info/
 
     python -m pip install --upgrade pip
     python -m pip install -r <(python -c "import tomllib; print('\n'.join(tomllib.load(open('pyproject.toml','rb'))['project']['dependencies']))")
-    python -m pip install setuptools pybind11 packaging
-    NO_VCS_VERSION=1 python setup.py bdist_wheel
+    python -m pip install build setuptools pybind11 packaging
+    NO_VCS_VERSION=1 python -m build --wheel --no-isolation
 
     echo "install_megatron_develop_whl"
     python -m pip install --ignore-installed dist/megatron_core-*.whl --no-cache-dir --force-reinstall --no-dependencies
@@ -56,7 +56,7 @@ megatron_build (){
     commit=${COMMIT_ID:-unknown}
     commit=${commit:0:7}
 
-    whl_file=$(ls $swift_dir/dist/megatron_core-*.whl)
+    whl_file=$(ls $megatron_dir/dist/megatron_core-*.whl)
     base_name=$(basename $whl_file)
     new_name=$(echo $base_name | sed "s/^\(megatron_core-[0-9.]*\)-/\1+${commit}-/")
     echo "commit whl: $new_name"
@@ -69,7 +69,7 @@ megatron_build (){
 }
 
 # main
-cd ${swift_dir}
+cd ${megatron_dir}
 echo -e "\033[32m ---- make Megatron-LM.tar.gz  \033[0m"
 megatron_tar
 echo -e "\033[32m ---- build Megatron-LM whl  \033[0m"
