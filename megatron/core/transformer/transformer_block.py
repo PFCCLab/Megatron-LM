@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple, Union, cast
@@ -83,6 +84,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_DSV4_ACCURACY_COMPATIBLE = os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 
 
 def get_num_layers_to_build(
@@ -400,9 +402,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             if self.config.enable_hyper_connections:
                 hc_mult = self.config.num_residual_streams
                 hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+                self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+                self.hc_head_scale = nn.Parameter(torch.ones(1))
+                if not _DSV4_ACCURACY_COMPATIBLE:
+                    self.hc_head_fn = mark_keep_in_fp32(self.hc_head_fn)
+                    self.hc_head_base = mark_keep_in_fp32(self.hc_head_base)
+                    self.hc_head_scale = mark_keep_in_fp32(self.hc_head_scale)
                 nn.init.xavier_uniform_(self.hc_head_fn)
                 if self.config.sequence_parallel:
                     setattr(self.hc_head_fn, 'sequence_parallel', True)

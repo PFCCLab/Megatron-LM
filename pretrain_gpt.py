@@ -23,6 +23,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from dsv4_alignment_replay import override_batch_with_replay
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.context_parallel_layout import finalize_packed_seq_params
@@ -30,6 +31,9 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.models.common.language_module.loss_logging import (
+    log_accuracy_compatible_final_loss,
+)
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
@@ -161,6 +165,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
         needs_padding_mask=needs_padding_mask,
     )
+    batch = override_batch_with_replay(batch, args)
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
@@ -185,15 +190,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             qkv_format='thd',
         )
         finalize_packed_seq_params(packed_seq_params)
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            packed_seq_params,
-            None,
-        )
+        return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
     if cu_seqlens is None:
@@ -321,6 +318,8 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    log_accuracy_compatible_final_loss(loss / num_tokens.clamp(min=1))
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()

@@ -4,6 +4,7 @@ import os
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
@@ -15,6 +16,9 @@ try:
 except:
     te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.models.common.language_module.loss_logging import (
+    log_accuracy_compatible_per_token_loss,
+)
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
@@ -153,7 +157,18 @@ class LanguageModule(MegatronModule):
         """
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
-        if self.config.cross_entropy_loss_fusion:
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and parallel_state.get_tensor_model_parallel_world_size() == 1
+            and logits.ndim == 3
+        ):
+            loss = F.cross_entropy(
+                logits.float().reshape(-1, logits.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+                ignore_index=-100,
+            ).view_as(labels)
+        elif self.config.cross_entropy_loss_fusion:
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
@@ -186,6 +201,7 @@ class LanguageModule(MegatronModule):
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
+        log_accuracy_compatible_per_token_loss(loss)
         return loss
 
     def setup_embeddings_and_output_layer(self) -> None:

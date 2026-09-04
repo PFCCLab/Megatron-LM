@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import os
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -18,16 +19,24 @@ if TYPE_CHECKING:
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+_DSV4_ACCURACY_COMPATIBLE = os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
-    M = input_logits.softmax(dim=-1) + eps
-    M = M / (M.sum(dim=-2, keepdim=True) + eps)
-    for _ in range(num_iterations - 1):
-        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+    if _DSV4_ACCURACY_COMPATIBLE:
+        row_max = input_logits.max(dim=-1, keepdim=True).values
+        M = torch.exp(input_logits - row_max)
+        for _ in range(num_iterations):
+            M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
+            M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+    else:
+        M = input_logits.softmax(dim=-1) + eps
         M = M / (M.sum(dim=-2, keepdim=True) + eps)
+        for _ in range(num_iterations - 1):
+            M = M / (M.sum(dim=-1, keepdim=True) + eps)
+            M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M
 
 
@@ -136,7 +145,10 @@ def native_h_post_bda(
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    if _DSV4_ACCURACY_COMPATIBLE:
+        mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
+    else:
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
@@ -259,11 +271,12 @@ class HyperConnectionModule(MegatronModule):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
-        mark_keep_in_fp32(self.mapping_proj.weight)
-        mark_keep_in_fp32(self.alpha_pre)
-        mark_keep_in_fp32(self.alpha_post)
-        mark_keep_in_fp32(self.alpha_res)
-        mark_keep_in_fp32(self.bias)
+        if not _DSV4_ACCURACY_COMPATIBLE:
+            mark_keep_in_fp32(self.mapping_proj.weight)
+            mark_keep_in_fp32(self.alpha_pre)
+            mark_keep_in_fp32(self.alpha_post)
+            mark_keep_in_fp32(self.alpha_res)
+            mark_keep_in_fp32(self.bias)
         self.norm_eps = 1e-6
 
         # Choose implementation: unified fused kernels vs reference modules.
@@ -329,8 +342,11 @@ class HyperConnectionModule(MegatronModule):
         # The mHC mapping computation runs in FP32: the parameters are kept in
         # FP32 and the activations are upcast here, then compute_mappings casts
         # the bounded mixing weights back to the activation dtype.
-        x_2d = x.reshape(s * b, nC).to(torch.float32)
-        weight = self.mapping_proj.weight.to(torch.float32)
+        x_2d = x.reshape(s * b, nC)
+        weight = self.mapping_proj.weight
+        if not _DSV4_ACCURACY_COMPATIBLE:
+            x_2d = x_2d.to(torch.float32)
+            weight = weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
@@ -360,7 +376,9 @@ class HyperConnectionModule(MegatronModule):
 
         h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
+        h_pre = h[..., : self.n].sigmoid()
+        if not _DSV4_ACCURACY_COMPATIBLE:
+            h_pre = h_pre + self.compute_h_eps
 
         # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
         h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
@@ -600,10 +618,13 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
-        # Split into 3 views to avoid extra grad accumulations in backward
-        hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
-            hidden_states, self._fused_add_3_op
-        )
+        if _DSV4_ACCURACY_COMPATIBLE:
+            hs_for_mappings = hs_for_aggregate = hs_for_residual = hidden_states
+        else:
+            # Split into 3 views to avoid extra grad accumulations in backward
+            hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
+                hidden_states, self._fused_add_3_op
+            )
 
         # Compute mappings
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
@@ -641,10 +662,13 @@ class HyperConnectionModule(MegatronModule):
         """
         from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
-        # Split into 3 views to avoid extra grad accumulations in backward
-        hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
-            hidden_states, self._fused_add_3_op
-        )
+        if _DSV4_ACCURACY_COMPATIBLE:
+            hs_for_mappings = hs_for_aggregate = hs_for_residual = hidden_states
+        else:
+            # Split into 3 views to avoid extra grad accumulations in backward
+            hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
+                hidden_states, self._fused_add_3_op
+            )
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 

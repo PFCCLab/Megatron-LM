@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -50,6 +51,11 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+
+def _dsv4_accuracy_compatible_enabled() -> bool:
+    return os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -661,6 +667,33 @@ def unfused_compressed_sparse_attn(
     """
     is_thd = query.ndim == 3
 
+    if not is_thd and os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        sq, b, np_, hn = query.size()
+        kv_t = kv_full.permute(1, 0, 2)
+        safe_indices = topk_indices.clamp(min=0).long()
+        safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, -1, hn)
+        kv_gathered = torch.gather(
+            kv_t.unsqueeze(1).expand(-1, sq, -1, -1), dim=2, index=safe_indices_exp
+        )
+
+        q = query.permute(1, 2, 0, 3).float()
+        kv_g = kv_gathered.float()
+        scores = torch.einsum("bnsh,bskh->bnsk", q, kv_g) * softmax_scale
+        invalid_mask = (topk_indices < 0).unsqueeze(1)
+        scores = scores.masked_fill(invalid_mask, float("-inf"))
+
+        sink = attn_sink.view(1, np_, 1, 1).float()
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        scores_max = torch.max(scores_max, sink)
+        exp_scores = torch.exp(scores - scores_max)
+        exp_sink = torch.exp(sink - scores_max)
+        attn_weights = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
+
+        output = torch.einsum("bnsk,bskh->bnsh", attn_weights, kv_g)
+        output = output.to(query.dtype)
+        output = output.permute(2, 0, 1, 3).contiguous()
+        return output.reshape(sq, b, np_ * hn)
+
     # ----------- Layout-specific input prep -------------------------------
     if is_thd:
         q_flat = query  # (rows, np, hn)
@@ -1093,7 +1126,9 @@ class Compressor(MegatronModule):
             compress_ratio, proj_out_dim, device=torch.cuda.current_device(), dtype=torch.float32
         )
         config.init_method(_ape)
-        self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
+        self.ape = nn.Parameter(_ape)
+        if not _dsv4_accuracy_compatible_enabled():
+            self.ape = mark_keep_in_fp32(self.ape)
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"
@@ -1174,8 +1209,11 @@ class Compressor(MegatronModule):
         if self.overlap:
             kv = self._overlap_transform(kv, fill_value=0)
             score = self._overlap_transform(score, fill_value=float("-inf"))
-        weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
-        kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
+        if _dsv4_accuracy_compatible_enabled():
+            kv = (kv * torch.softmax(score, dim=1)).sum(dim=1)
+        else:
+            weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
+            kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
         kv = self.norm(kv.to(x.dtype))
         kv = _apply_rope(
             kv,
@@ -1757,9 +1795,9 @@ class CompressedSparseAttention(MegatronModule):
 
         # Learnable attention sink per head, kept in high precision
         # (FP32 in the reference DeepSeek V4 checkpoint)
-        self.attn_sink = mark_keep_in_fp32(
-            nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
-        )
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+        if not _dsv4_accuracy_compatible_enabled():
+            self.attn_sink = mark_keep_in_fp32(self.attn_sink)
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
@@ -1874,30 +1912,51 @@ class CompressedSparseAttention(MegatronModule):
                     )
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
-                    weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
-                    non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
-                        query, kv_full[:offset], self.attn_sink, window_idxs, self.softmax_scale
-                    )
-                    topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
-                        q_indexer,
-                        weights_for_unfused,
-                        k_indexer,
-                        query.detach(),
-                        key_for_loss.detach(),
-                        self.softmax_scale,
-                        min(self.indexer.index_topk, n_compressed),
-                        indexer_loss_coeff,
-                        causal_mask,
-                        getattr(self.config, "dsa_indexer_use_sparse_loss", True),
-                        self.indexer.pg_collection,
-                        None,
-                        None,
-                        None,
-                        None,
-                        self.config.calculate_per_token_loss,
-                        True,
-                        non_compressed_lse,
-                    )
+                    if _dsv4_accuracy_compatible_enabled():
+                        weights_for_unfused = weights_indexer * self.indexer.softmax_scale
+                        topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
+                            q_indexer,
+                            weights_for_unfused,
+                            k_indexer,
+                            query.detach(),
+                            key_for_loss.detach(),
+                            self.softmax_scale,
+                            min(self.indexer.index_topk, n_compressed),
+                            indexer_loss_coeff,
+                            causal_mask,
+                            getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+                            self.indexer.pg_collection,
+                            None,
+                            None,
+                            None,
+                            None,
+                            self.config.calculate_per_token_loss,
+                        )
+                    else:
+                        weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
+                        non_compressed_lse = _compute_unfused_csa_non_compressed_lse(
+                            query, kv_full[:offset], self.attn_sink, window_idxs, self.softmax_scale
+                        )
+                        topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
+                            q_indexer,
+                            weights_for_unfused,
+                            k_indexer,
+                            query.detach(),
+                            key_for_loss.detach(),
+                            self.softmax_scale,
+                            min(self.indexer.index_topk, n_compressed),
+                            indexer_loss_coeff,
+                            causal_mask,
+                            getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+                            self.indexer.pg_collection,
+                            None,
+                            None,
+                            None,
+                            None,
+                            self.config.calculate_per_token_loss,
+                            True,
+                            non_compressed_lse,
+                        )
                     if indexer_loss_coeff > 0:
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                             loss=indexer_loss,
@@ -1910,7 +1969,12 @@ class CompressedSparseAttention(MegatronModule):
                     )
 
                 n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
-                valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
+                if _dsv4_accuracy_compatible_enabled():
+                    valid = topk_indices_compressed < n_valid_per_pos
+                else:
+                    valid = (topk_indices_compressed >= 0) & (
+                        topk_indices_compressed < n_valid_per_pos
+                    )
                 compress_topk_idxs = torch.where(
                     valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
                 )

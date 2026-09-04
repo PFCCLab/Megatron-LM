@@ -2,6 +2,7 @@
 
 import copy
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
@@ -690,6 +691,14 @@ def fused_qk_topk_naive(
     # =========================================
     # [batch, seqlen, seqlen]
     index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        if mask is not None:
+            assert mask.dtype == index_scores.dtype, "Mask dtype must match index scores dtype"
+            index_scores = index_scores + mask
+        topk_k = min(index_topk, sk)
+        topk_indices = index_scores.topk(topk_k, dim=-1)[1]
+        return index_scores, topk_indices
+
     varlen_starts, varlen_ends, key_positions = dsa_masking.normalize_varlen_bounds(
         mask=mask,
         varlen_starts=varlen_starts,
@@ -775,6 +784,120 @@ def fwd_fused_indexer_loss_naive(
     return topk_indices, indexer_loss
 
 
+def _bwd_fused_indexer_loss_legacy_sbhd(
+    q,
+    weights,
+    k,
+    query,
+    key,
+    topk_indices,
+    softmax_scale,
+    loss_coeff,
+    sparse_loss,
+    grad_loss,
+    pg_collection,
+    causal_mask_override=None,
+    calculate_per_token_loss=False,
+):
+    """Reproduce the pre-varlen SBHD indexer-loss backward operation order."""
+    index_scores = _compute_index_scores(q, weights, k)
+
+    sq, b, np, hn = query.size()
+    sk = key.size(0)
+    query_reshaped = query.permute(1, 2, 0, 3).reshape(b * np, sq, hn)
+    key_reshaped = key.permute(1, 2, 3, 0).reshape(b * np, hn, sk)
+    attention_scores = torch.bmm(query_reshaped.float(), key_reshaped.float()) * softmax_scale
+    attention_scores = attention_scores.reshape(b, np, sq, sk)
+
+    if causal_mask_override is not None:
+        causal_mask = causal_mask_override.to(dtype=torch.float32)
+    else:
+        causal_mask = torch.triu(
+            torch.full(
+                (sq, sk), float('-inf'), dtype=torch.float32, device=attention_scores.device
+            ),
+            diagonal=1,
+        )
+    index_mask = torch.full(
+        (b, sq, sk), float("-inf"), dtype=torch.float32, device=causal_mask.device
+    ).scatter_(-1, topk_indices, 0)
+
+    if causal_mask.dim() == 3:
+        attention_scores = attention_scores + causal_mask.unsqueeze(1)
+        index_scores = index_scores + causal_mask
+    else:
+        attention_scores = attention_scores + causal_mask.view(1, 1, sq, sk)
+        index_scores = index_scores + causal_mask.unsqueeze(0)
+
+    if sparse_loss:
+        attention_scores = attention_scores + index_mask.view(b, 1, sq, sk)
+        index_scores = index_scores + index_mask
+
+    row_valid = (causal_mask > float('-inf')).any(dim=-1)
+    if row_valid.dim() == 1:
+        attn_row_mask = row_valid.view(1, 1, sq, 1)
+        idx_row_mask = row_valid.view(1, sq, 1)
+    else:
+        attn_row_mask = row_valid.view(b, 1, sq, 1)
+        idx_row_mask = row_valid.view(b, sq, 1)
+
+    attention_scores = attention_scores.masked_fill(~attn_row_mask, 0.0)
+    index_scores = index_scores.masked_fill(~idx_row_mask, 0.0)
+    attention_scores_softmax = torch.nn.functional.softmax(
+        attention_scores, dim=-1, dtype=torch.float32
+    )
+    index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    attention_scores_softmax = attention_scores_softmax * attn_row_mask.float()
+    index_scores_softmax = index_scores_softmax * idx_row_mask.float()
+
+    attention_scores_sum = attention_scores_softmax.sum(dim=1)
+    if pg_collection.tp.size() > 1:
+        torch.distributed.all_reduce(attention_scores_sum.contiguous(), group=pg_collection.tp)
+    attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
+        dim=-1, keepdim=True
+    ).clamp(min=1e-10)
+
+    grad_kl_div = grad_loss * loss_coeff
+    if calculate_per_token_loss:
+        grad_kl_per_row = grad_kl_div
+    else:
+        grad_kl_per_row = grad_kl_div / (b * sq)
+    grad_kl_per_element = grad_kl_per_row.view(1, 1, 1).expand(b, sq, sk)
+    grad_index_scores_softmax = (
+        -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
+    )
+    sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
+    grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
+
+    if causal_mask_override is not None:
+        cm = causal_mask_override.to(dtype=torch.float32)
+        if cm.dim() == 2:
+            cm = cm.unsqueeze(0)
+        causal_valid_mask = (cm == 0).squeeze(0) if cm.shape[0] == 1 else (cm == 0)
+    else:
+        causal_valid_mask = torch.tril(torch.ones((sq, sk), device=q.device, dtype=torch.bool))
+    if causal_valid_mask.dim() == 2:
+        causal_valid_mask = causal_valid_mask.unsqueeze(0)
+    causal_valid_mask = causal_valid_mask.expand(b, sq, sk)
+    if sparse_loss:
+        valid_mask = causal_valid_mask & (index_mask == 0)
+    else:
+        valid_mask = causal_valid_mask
+    grad_index_scores_logits = grad_index_scores_logits * valid_mask.float()
+
+    grad_index_scores = grad_index_scores_logits.transpose(0, 1)
+    grad_weighted_scores = grad_index_scores.unsqueeze(2)
+    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+    relu_mask = scores > 0
+    scores_after_relu = torch.relu(scores)
+    grad_weights = (grad_weighted_scores * scores_after_relu).sum(dim=-1)
+    grad_scores_after_relu = grad_weighted_scores * weights.unsqueeze(-1)
+    grad_scores = grad_scores_after_relu * relu_mask.float()
+    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())
+    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())
+    return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
+
+
 def bwd_fused_indexer_loss_naive(
     q,
     weights,
@@ -799,6 +922,31 @@ def bwd_fused_indexer_loss_naive(
     """Naive implementation of backward pass for indexer loss."""
     query, _ = dsa_layout.ensure_sbhd(query, "query")
     key, _ = dsa_layout.ensure_sbhd(key, "key")
+
+    if (
+        os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+        and varlen_starts is None
+        and varlen_ends is None
+        and key_positions is None
+        and query_valid_rows is None
+        and use_relu
+        and non_compressed_lse is None
+    ):
+        return _bwd_fused_indexer_loss_legacy_sbhd(
+            q,
+            weights,
+            k,
+            query,
+            key,
+            topk_indices,
+            softmax_scale,
+            loss_coeff,
+            sparse_loss,
+            grad_loss,
+            pg_collection,
+            causal_mask_override=mask,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
 
     index_scores = _compute_index_scores(q, weights, k, use_relu=use_relu)  # [B, Sq, Sk]
 
@@ -923,13 +1071,21 @@ def bwd_fused_indexer_loss_naive(
             dtype=grad_kl_per_element.dtype
         )
 
-    # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
-    # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
-    # valid predicted probabilities are smaller than eps.
-    grad_index_scores_logits = (
-        index_scores_softmax - attention_scores_normalized
-    ) * grad_kl_per_element
-    del index_scores_softmax, attention_scores_normalized
+    if os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1":
+        grad_index_scores_softmax = (
+            -attention_scores_normalized / (index_scores_softmax + 1e-10) * grad_kl_per_element
+        )
+        sum_grad = (grad_index_scores_softmax * index_scores_softmax).sum(dim=-1, keepdim=True)
+        grad_index_scores_logits = index_scores_softmax * (grad_index_scores_softmax - sum_grad)
+        del (index_scores_softmax, attention_scores_normalized, grad_index_scores_softmax, sum_grad)
+    else:
+        # For KL(target || softmax(logits)), the exact logit gradient is predict - target.
+        # Computing it through -target / (predict + eps) incorrectly suppresses gradients when
+        # valid predicted probabilities are smaller than eps.
+        grad_index_scores_logits = (
+            index_scores_softmax - attention_scores_normalized
+        ) * grad_kl_per_element
+        del index_scores_softmax, attention_scores_normalized
 
     # Zero out gradients for masked positions.
     if sparse_loss:

@@ -2,6 +2,7 @@
 
 """Megatron Module."""
 
+import os
 from functools import partial
 from typing import Optional, Tuple
 
@@ -578,6 +579,12 @@ class Float16Module(MegatronModule):
 
         else:
             raise Exception('Either config.fp16 or config.bf16 should be True.')
+
+        if (
+            os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+            and getattr(config, 'moe_router_bias_update_rate', 0.0) != 0.0
+        ):
+            config.moe_router_bias_update_rate = 0.0
 
         self.float16_convertor = float16_convertor
 

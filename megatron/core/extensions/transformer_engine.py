@@ -707,6 +707,22 @@ class TENorm:
         if use_fused_residual and config.normalization != "RMSNorm":
             raise ValueError("Fused residual is only supported " "for RMSNorm normalization")
 
+        if (
+            config.normalization == "RMSNorm"
+            and os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+        ):
+            if config.layernorm_zero_centered_gamma:
+                raise ValueError("torch.nn.RMSNorm does not support zero-centered gamma")
+            extra_kwargs = _get_extra_te_kwargs(config)
+            instance = torch.nn.RMSNorm(
+                normalized_shape=hidden_size,
+                eps=eps,
+                device=extra_kwargs.get("device", None),
+                dtype=config.params_dtype,
+            )
+            instance.weight.sequence_parallel = config.sequence_parallel
+            return cast(LayerNormInterface, instance)
+
         if config.normalization == "LayerNorm":
             norm_module = te.pytorch.LayerNorm
         elif config.normalization == "RMSNorm":

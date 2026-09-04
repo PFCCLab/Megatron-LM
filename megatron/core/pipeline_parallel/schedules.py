@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+import os
 from functools import partial
 from itertools import zip_longest
 from typing import Callable, Dict, Iterator, List, Optional, Union
@@ -277,7 +278,12 @@ def _get_experimental_attention_variant_loss_scale_func(config):
     if loss_scale_func is not None:
         return loss_scale_func
 
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+    attention_variant = getattr(config, 'experimental_attention_variant', None)
+    dsv4_accuracy_compatible = (
+        os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
+        and attention_variant == 'dsv4_hybrid'
+    )
+    if attention_variant == 'dsa' or dsv4_accuracy_compatible:
         from megatron.core.transformer.experimental_attention_variant.dsa import (
             DSAIndexerLossAutoScaler,
         )
@@ -1743,7 +1749,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = True
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
-                (input_tensor, output_tensor_grad) = (
+                input_tensor, output_tensor_grad = (
                     p2p_communicator.send_forward_backward_recv_forward_backward(
                         output_tensor,
                         input_tensor_grad,
@@ -1807,7 +1813,7 @@ def forward_backward_pipelining_with_interleaving(
                 if is_pp_last_stage(p2p_communicator.pp_group):
                     recv_next = False
 
-                (bwd_recv_buffer[-1], bwd_wait_handles) = (
+                bwd_recv_buffer[-1], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -1960,7 +1966,7 @@ def forward_backward_pipelining_with_interleaving(
                     backward_k, forward=False
                 )
 
-                (bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles) = (
+                bwd_recv_buffer[backward_k % bwd_recv_buffer_size], bwd_wait_handles = (
                     p2p_communicator.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=recv_next,
@@ -2033,7 +2039,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_prev = False
 
             # Communicate tensors.
-            (input_tensor, output_tensor_grad) = (
+            input_tensor, output_tensor_grad = (
                 p2p_communicator.send_forward_backward_recv_forward_backward(
                     output_tensor,
                     input_tensor_grad,

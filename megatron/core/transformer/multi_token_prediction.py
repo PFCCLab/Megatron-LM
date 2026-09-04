@@ -1,6 +1,7 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
+import os
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
+from megatron.core.models.common.language_module.loss_logging import (
+    suppress_accuracy_compatible_loss_logging,
+)
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -56,6 +60,8 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
+
+_DSV4_ACCURACY_COMPATIBLE = os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 
 
 _MTP_SEQUENCE_FIELD_FILL_VALUES = {
@@ -1817,10 +1823,12 @@ def process_mtp_loss(
             )
             if scale_logits_fn is not None:
                 mtp_logits = scale_logits_fn(mtp_logits)
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+            with suppress_accuracy_compatible_loss_logging():
+                mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
 
         if is_training:
+            mtp_loss_sum = torch.sum(mtp_loss)
             correct = None
             total = None
             if mtp_logits is not None and MTPLossLoggingHelper.should_collect_acceptance():
@@ -1829,7 +1837,7 @@ def process_mtp_loss(
                 )
 
             MTPLossLoggingHelper.save_loss_to_tracker(
-                torch.sum(mtp_loss),
+                mtp_loss_sum,
                 num_tokens,
                 mtp_layer_number,
                 config.mtp_num_layers,
@@ -2061,9 +2069,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.mhc_enabled:
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
+            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
+            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            if not _DSV4_ACCURACY_COMPATIBLE:
+                self.hc_head_fn = mark_keep_in_fp32(self.hc_head_fn)
+                self.hc_head_base = mark_keep_in_fp32(self.hc_head_base)
+                self.hc_head_scale = mark_keep_in_fp32(self.hc_head_scale)
             nn.init.xavier_uniform_(self.hc_head_fn)
             if self.config.sequence_parallel:
                 setattr(self.hc_head_fn, 'sequence_parallel', True)
@@ -2932,7 +2944,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
+            hidden_states, input_ids, position_ids, padding_mask = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,

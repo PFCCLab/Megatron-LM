@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -53,6 +54,10 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+
+def _dsv4_megatron_moe_fp32_accum_enabled() -> bool:
+    return os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") == "1"
 
 
 def switch_load_balancing_loss_func(
@@ -434,10 +439,25 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
-    # use the mapping to permute the tokens
-    permuted_input = tokens.index_select(0, sorted_indices)
+    # Use the mapping to permute the tokens.
+    if _dsv4_megatron_moe_fp32_accum_enabled() and not drop_and_pad:
+        # Force index_select backward's scatter-add accumulation through FP32.
+        permuted_input = tokens.float().index_select(0, sorted_indices).to(tokens.dtype)
+    else:
+        permuted_input = tokens.index_select(0, sorted_indices)
 
     return permuted_input, permuted_probs, sorted_indices, None, tokens_per_expert
+
+
+def _dsv4_unpermute_fp32_accum(
+    permuted_tokens: torch.Tensor, sorted_indices: torch.Tensor, restore_shape: torch.Size
+) -> torch.Tensor:
+    _, hidden = restore_shape
+    output_tokens = torch.zeros(restore_shape, dtype=torch.float32, device=permuted_tokens.device)
+    output_tokens.scatter_add_(
+        0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens.to(torch.float32)
+    )
+    return output_tokens.to(dtype=permuted_tokens.dtype)
 
 
 def unpermute(
@@ -478,7 +498,9 @@ def unpermute(
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
-    if fused:
+    fp32_accum_enabled = _dsv4_megatron_moe_fp32_accum_enabled()
+    fp32_accum_supports_mapping = fp32_accum_enabled and sorted_indices.dim() == 1
+    if fused and not fp32_accum_supports_mapping:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
         extra_kwargs = {}
@@ -520,6 +542,11 @@ def unpermute(
         # additional GPU memory usage. Use --moe-permute-fusion flag to avoid this extra memory
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
+
+    if fp32_accum_enabled and probs is None and not drop_and_pad and sorted_indices.dim() == 1:
+        return _dsv4_unpermute_fp32_accum(permuted_tokens, sorted_indices, restore_shape).to(
+            dtype=input_dtype
+        )
 
     # Create an output tensor filled with zeros
     output_tokens = torch.zeros(
@@ -1353,7 +1380,12 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
-        if te_general_gemm is not None and router_dtype != torch.float64:
+        use_te_router_gemm = (
+            te_general_gemm is not None
+            and router_dtype != torch.float64
+            and os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") != "1"
+        )
+        if use_te_router_gemm:
             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
         elif bias is None:
@@ -1386,7 +1418,12 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+        use_te_router_gemm = (
+            te_general_gemm is not None
+            and ctx.router_dtype != torch.float64
+            and os.environ.get("FLAGS_use_accuracy_compatible_kernel", "0") != "1"
+        )
+        if use_te_router_gemm:
             grad_input = te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
