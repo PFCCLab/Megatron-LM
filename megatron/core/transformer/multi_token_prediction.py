@@ -19,6 +19,8 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.models.common.language_module.loss_logging import (
+    log_accuracy_compatible_final_loss,
+    log_accuracy_compatible_per_token_loss,
     suppress_accuracy_compatible_loss_logging,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -1826,6 +1828,8 @@ def process_mtp_loss(
             with suppress_accuracy_compatible_loss_logging():
                 mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
+        log_accuracy_compatible_per_token_loss(mtp_loss)
+        log_accuracy_compatible_final_loss(torch.sum(mtp_loss) / num_tokens.clamp(min=1))
 
         if is_training:
             mtp_loss_sum = torch.sum(mtp_loss)
