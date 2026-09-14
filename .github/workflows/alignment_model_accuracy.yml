@@ -154,7 +154,6 @@ jobs:
             echo "using $whl"
           done
           python -m pip install uv
-          bash PaddleFleet/scripts/alignment_model_accuracy/setup_venvs.sh
           bash -x PaddleFleet/scripts/alignment_model_accuracy/run_alignment_test.sh
 
           model_acc_align_exit_code=$?
