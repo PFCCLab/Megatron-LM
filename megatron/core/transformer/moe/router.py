@@ -7,7 +7,7 @@ import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
@@ -106,9 +106,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float64
         if self.config.router_accuracy_compatible:
             inp_shape = input.shape
-            logits = torch.mm(
-                input.reshape(-1, inp_shape[-1]).float(), self.weight.float().t()
-            )
+            logits = torch.mm(input.reshape(-1, inp_shape[-1]).float(), self.weight.float().t())
             if self.bias is not None:
                 logits = logits + self.bias.float()
             return logits.view(*inp_shape[:-1], -1)
@@ -615,10 +613,11 @@ class TopKRouter(Router):
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
         if self.enable_expert_bias and torch.is_grad_enabled():
-            with torch.no_grad():
-                if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+            if not _use_accuracy_compatible():
+                with torch.no_grad():
+                    if padding_mask is not None:
+                        routing_map = routing_map & (~padding_mask)
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function

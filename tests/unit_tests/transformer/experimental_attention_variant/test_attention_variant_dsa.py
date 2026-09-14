@@ -101,8 +101,7 @@ class TestAccuracyCompatibleDSA:
             return original(*args, **kwargs)
 
         monkeypatch.setattr(
-            "megatron.core.transformer.experimental_attention_variant.dsa.unfused_dsa_fn",
-            capture,
+            "megatron.core.transformer.experimental_attention_variant.dsa.unfused_dsa_fn", capture
         )
         common = dict(
             absorbed_mla=False,

@@ -10,7 +10,6 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelGroupedLinear,
     TERowParallelGroupedLinear,
 )
-from megatron.core.post_training.modelopt.layers import Linear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
@@ -107,6 +106,8 @@ class LocalSpecProvider(BackendSpecProvider):
         still returns TELinear; this method is the TE-off counterpart so a
         LocalSpecProvider DSA spec does not re-enter Transformer Engine.
         """
+        from megatron.core.post_training.modelopt.layers import Linear
+
         return Linear
 
     def column_parallel_linear(self) -> type:

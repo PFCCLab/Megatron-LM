@@ -23,11 +23,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
-from megatron.core.transformer.module import (
-    GraphableMegatronModule,
-    MegatronModule,
-    _use_accuracy_compatible,
-)
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -595,7 +591,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
-        if not (_use_accuracy_compatible() and _tp_size <= 1):
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
@@ -703,7 +699,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
             _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
-            if not (_use_accuracy_compatible() and _tp_size <= 1):
+            if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
                 hidden_states = make_viewless_tensor(
                     inp=hidden_states, requires_grad=True, keep_graph=True
                 )

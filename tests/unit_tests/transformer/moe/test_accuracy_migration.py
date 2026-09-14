@@ -1,4 +1,5 @@
 """CUDA unit tests for migrated MoE accuracy-compatible production paths."""
+
 from __future__ import annotations
 
 import ast
@@ -28,12 +29,18 @@ class NVLSAllGatherVDispatcher:
 def _load_fn(rel: str, name: str):
     src = (ROOT / rel).read_text()
     tree = ast.parse(src)
-    class_name = ("MoEFlexTokenDispatcher" if rel.endswith("token_dispatcher.py")
-                  else "MoELayer" if rel.endswith("moe_layer.py") else None)
+    class_name = (
+        "MoEFlexTokenDispatcher"
+        if rel.endswith("token_dispatcher.py")
+        else "MoELayer" if rel.endswith("moe_layer.py") else None
+    )
     body = tree.body
     if class_name:
-        body = next(node.body for node in tree.body
-                    if isinstance(node, ast.ClassDef) and node.name == class_name)
+        body = next(
+            node.body
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
     target = next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == name)
     target.decorator_list = []
     mod = ast.Module(body=[target], type_ignores=[])
@@ -78,6 +85,10 @@ class _FakeComm:
 
 
 class _Flex:
+    @property
+    def config(self):
+        return SimpleNamespace(dsa_accuracy_compatible=_UAC["on"])
+
     def __init__(self):
         self.shared_experts = None
         self._comm_manager = _FakeComm()
@@ -87,12 +98,21 @@ class _Flex:
 
 
 class _MoE:
+    @property
+    def config(self):
+        return SimpleNamespace(
+            dsa_accuracy_compatible=_UAC["on"],
+            sequence_parallel=True,
+            moe_shared_expert_overlap=False,
+            moe_latent_size=0,
+            fp8=False,
+            fp4=False,
+        )
+
     def __init__(self):
         self.training = False
         self.attn_tp_group = SimpleNamespace(size=lambda: 1)
-        self.config = SimpleNamespace(
-            sequence_parallel=True, moe_shared_expert_overlap=False, moe_latent_size=0, fp8=False, fp4=False
-        )
+
         self.token_dispatcher = SimpleNamespace(combine_postprocess=lambda x: x)
         self.shared_expert_overlap = False
         self.fwd_execution_map = {"route", "expert_compute", "postprocess"}
@@ -160,7 +180,9 @@ class TestAccuracyMigration(unittest.TestCase):
         x = torch.ones(2, 3, 4, device="cuda", requires_grad=True)
         _UAC["on"] = True
         out, _ = layer.forward(x)
-        self.assertEqual(layer.order, ["route", "preprocess", "dispatch", "routed", "combine", "shared"])
+        self.assertEqual(
+            layer.order, ["route", "preprocess", "dispatch", "routed", "combine", "shared"]
+        )
         self.assertTrue(torch.equal(out, 5 * x.detach()))
         out.sum().backward()
         self.assertTrue(torch.equal(x.grad, torch.full_like(x, 5)))
@@ -174,7 +196,9 @@ class TestAccuracyMigration(unittest.TestCase):
         _UAC["on"] = False
         x3 = torch.ones(2, 3, 4, device="cuda", requires_grad=True)
         out3, _ = layer.forward(x3)
-        self.assertEqual(layer.order, ["shared", "route", "preprocess", "dispatch", "routed", "combine"])
+        self.assertEqual(
+            layer.order, ["shared", "route", "preprocess", "dispatch", "routed", "combine"]
+        )
         self.assertTrue(torch.equal(out3, 5 * x3.detach()))
 
     def test_postprocess_mixed_dtype(self):
@@ -195,14 +219,25 @@ class TestAccuracyMigration(unittest.TestCase):
 
     def test_topk_routing_output_dtype_and_gradients(self):
         _UAC["on"] = True
-        logits = torch.tensor([[1.0, 2.0, 0.5, 3.0], [0.2, 4.0, 1.5, 0.8]], device="cuda", dtype=torch.bfloat16)
+        logits = torch.tensor(
+            [[1.0, 2.0, 0.5, 3.0], [0.2, 4.0, 1.5, 0.8]], device="cuda", dtype=torch.bfloat16
+        )
         logits = logits.clone().requires_grad_(True)
         for score in ("sigmoid", "sqrtsoftplus"):
             probs, _idx = topk_routing_with_score_function(
-                logits, topk=2, score_function=score, dense_output=True, fused=False, router_replay=None
+                logits,
+                topk=2,
+                score_function=score,
+                dense_output=True,
+                fused=False,
+                router_replay=None,
             )
             self.assertEqual(probs.dtype, logits.dtype)
-            self.assertTrue(torch.allclose(probs.float().sum(dim=-1), torch.ones(probs.size(0), device="cuda"), atol=0.01))
+            self.assertTrue(
+                torch.allclose(
+                    probs.float().sum(dim=-1), torch.ones(probs.size(0), device="cuda"), atol=0.01
+                )
+            )
             probs.sum().backward()
             self.assertTrue(torch.isfinite(logits.grad).all())
             logits.grad = None

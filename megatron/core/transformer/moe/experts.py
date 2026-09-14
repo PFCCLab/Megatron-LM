@@ -34,7 +34,7 @@ from megatron.core.transformer.mlp import (
     TEActivationFunctionBuilder,
     apply_swiglu_sharded_factory,
 )
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1351,12 +1351,14 @@ class SequentialMLP(MegatronModule):
                 # The unfused Paddle expert pads tiny GEMMs to 32 rows. The
                 # grouped-storage fallback uses real token counts instead.
                 num_real_tokens = tokens.shape[0]
-                pad_small_expert = (
-                    self.config.use_accuracy_compatible
-                    and not self.config.moe_grouped_gemm
-                    and not (self.config.fp8 or self.config.fp4)
-                    and 0 < num_real_tokens < 17
-                )
+                pad_small_expert = _use_accuracy_compatible() and 0 < num_real_tokens < 17
+                if self.config.dsa_accuracy_compatible:
+                    pad_small_expert = (
+                        self.config.use_accuracy_compatible
+                        and not self.config.moe_grouped_gemm
+                        and not (self.config.fp8 or self.config.fp4)
+                        and 0 < num_real_tokens < 17
+                    )
                 if pad_small_expert:
                     num_pad_tokens = 32 - num_real_tokens
                     tokens = torch.cat(

@@ -282,7 +282,11 @@ class VocabParallelEmbedding(torch.nn.Module):
             )
         )
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
-        self.deterministic_mode = config.deterministic_mode or config.use_accuracy_compatible
+        self.deterministic_mode = (
+            config.deterministic_mode
+            or _use_accuracy_compatible()
+            or config.use_accuracy_compatible
+        )
         self.config = config
 
         self.use_inference_optimized_reduce_scatter = (
@@ -345,7 +349,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Get the embeddings.
         if self.deterministic_mode:
             _tp_size = 1 if self.tp_group is None else self.tp_group.size()
-            if self.config.use_accuracy_compatible and _tp_size <= 1:
+            if getattr(self.config, "dsa_accuracy_compatible", False) and _tp_size <= 1:
                 output_parallel = _EmbedFp32MainGrad.apply(self.weight, masked_input)
             else:
                 output_parallel = self.weight[masked_input]
@@ -724,6 +728,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dsa_accuracy_compatible: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -790,12 +795,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     _tp_size = 1 if tp_group is None else tp_group.size()
-    if (
-        _use_accuracy_compatible()
-        and _tp_size <= 1
-        and not sequence_parallel
-        and not allreduce_dgrad
-    ):
+    if dsa_accuracy_compatible and _tp_size <= 1 and not sequence_parallel and not allreduce_dgrad:
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
@@ -838,24 +838,16 @@ linear_with_grad_accumulation_and_async_allreduce.warned = False
 
 
 def _expert_grads_need_own_dp_domain(config) -> bool:
-    """Whether expert parameters must be reduced over the expert-data-parallel group.
+    """Use expert DP for split expert tensor groups in DSA alignment.
 
-    mcore normally decides this from ``expert_model_parallel_size > 1`` alone, which
-    is correct only when the expert tensor-parallel size equals the dense one: the
-    expert parameter is then sharded exactly like a dense parameter and its
-    data-parallel domain coincides with ``dp_cp``.
-
-    With ``expert_tensor_parallel_size < tensor_model_parallel_size`` (the accuracy
-    -compatible topology uses ETP=1 with TP=2) every rank in the tensor-parallel
-    group holds a FULL copy of the expert weight while consuming only its own
-    sequence-parallel shard of the tokens. Those partial weight gradients live in a
-    larger data-parallel domain (``expt_dp`` = TP/ETP times ``dp_cp``) and must be
-    summed. Leaving ``allreduce=True`` puts them in the dense bucket, which is
-    reduced over ``dp_cp`` — size 1 in this topology — so the reduction silently
-    never happens and every expert gradient stays a per-rank partial sum.
+    The default retains EP-only grouping. With DSA TP2/ETP1, expert replicas
+    consume different sequence shards: reduce their gradients over expt_dp
+    instead of the dense dp_cp group.
     """
     if config.expert_model_parallel_size > 1:
         return True
+    if not getattr(config, 'dsa_accuracy_compatible', False):
+        return False
     etp = getattr(config, 'expert_tensor_parallel_size', None)
     if etp is None:
         return False
@@ -1084,7 +1076,13 @@ class ColumnParallelLinear(torch.nn.Module):
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input,
+                weight,
+                *args,
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
+                **kwargs,
+            )
 
     def forward(
         self,
@@ -1132,7 +1130,9 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.disable_grad_reduce
         ):
             input_parallel = input_
-        elif _use_accuracy_compatible() and (self.tp_group is None or self.tp_group.size() <= 1):
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
+            self.tp_group is None or self.tp_group.size() <= 1
+        ):
             input_parallel = input_
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
@@ -1180,7 +1180,7 @@ class ColumnParallelLinear(torch.nn.Module):
             gather_output = runtime_gather_output
 
         if gather_output and (
-            not _use_accuracy_compatible()
+            not getattr(self.config, "dsa_accuracy_compatible", False)
             or (self.tp_group is not None and self.tp_group.size() > 1)
         ):
             # All-gather across the partitions.
@@ -1411,7 +1411,13 @@ class RowParallelLinear(torch.nn.Module):
         if not weight.requires_grad:
             return linear_with_frozen_weight(input, weight, *args, **kwargs)
         else:
-            return linear_with_grad_accumulation_and_async_allreduce(input, weight, *args, **kwargs)
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input,
+                weight,
+                *args,
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
+                **kwargs,
+            )
 
     def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward of RowParallelLinear
@@ -1461,7 +1467,9 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
-        elif _use_accuracy_compatible() and (self.tp_group is None or self.tp_group.size() <= 1):
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
+            self.tp_group is None or self.tp_group.size() <= 1
+        ):
             output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)

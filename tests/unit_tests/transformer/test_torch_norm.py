@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import pytest
 import torch
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -23,3 +24,17 @@ def test_rmsnorm_uses_native_torch_implementation():
 
     assert isinstance(norm, torch.nn.RMSNorm)
     assert norm.weight.dtype == torch.bfloat16
+
+
+def test_sequence_parallel_is_opt_in_for_native_norm():
+    with pytest.raises(AssertionError, match="sequence parallel"):
+        WrappedTorchNorm(
+            config=_config(sequence_parallel=True, tensor_model_parallel_size=2),
+            hidden_size=64,
+            eps=1e-5,
+        )
+    config = _config(
+        sequence_parallel=True, tensor_model_parallel_size=2, norm_accuracy_compatible=True
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=64, eps=1e-5)
+    assert all(parameter.sequence_parallel for parameter in norm.parameters())

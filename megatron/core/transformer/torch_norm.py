@@ -41,32 +41,32 @@ class WrappedTorchNorm:
         zero_centered_gamma: bool = False,
         normalization: str = "LayerNorm",
     ) -> LayerNormInterface:
-        assert not config.layernorm_zero_centered_gamma, (
-            f"zero_centered_gamma not supported by torch LayerNorm"
-        )
+        assert (
+            not config.layernorm_zero_centered_gamma
+        ), f"zero_centered_gamma not supported by torch LayerNorm"
 
-        assert not config.persist_layer_norm, (
-            f"persist_layer_norm not supported by torch LayerNorm"
-        )
+        assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
-        assert not config.memory_efficient_layer_norm, (
-            f"memory_efficient_layer_norm not supported by torch LayerNorm"
-        )
+        assert (
+            config.norm_accuracy_compatible or not config.sequence_parallel
+        ), "sequence parallel not supported by torch LayerNorm"
+
+        assert (
+            not config.memory_efficient_layer_norm
+        ), f"memory_efficient_layer_norm not supported by torch LayerNorm"
 
         if config.normalization == "LayerNorm":
             norm_cls = torch.nn.LayerNorm
         elif config.normalization == "RMSNorm":
-            assert is_torch_min_version("2.4.0a0"), (
-                "Torch RMSNorm requires PyTorch version >= 2.4.0"
-            )
+            assert is_torch_min_version(
+                "2.4.0a0"
+            ), 'Torch RMSNorm requires PyTorch version >= 2.4.0'
 
             norm_cls = torch.nn.RMSNorm
         elif config.normalization == "L2Norm":
             norm_cls = torch.nn.L2Norm
         else:
-            raise Exception(
-                "Only LayerNorm, RMSNorm and L2Norm are currently supported"
-            )
+            raise Exception("Only LayerNorm, RMSNorm and L2Norm are currently supported")
 
         factory_kwargs = {}
         if config.normalization == "RMSNorm" and config.norm_accuracy_compatible:
@@ -108,9 +108,7 @@ class L2Norm(torch.nn.Module, LayerNormInterface):
             torch.Tensor: The L2-normalized tensor.
         """
         x_float = x.float()
-        return (
-            x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)
-        ).type_as(x)
+        return (x_float * torch.rsqrt(x_float.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

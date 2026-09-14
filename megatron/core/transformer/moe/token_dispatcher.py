@@ -17,7 +17,6 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import _use_accuracy_compatible
 from megatron.core.transformer.moe.fused_a2a import (
     fused_combine,
     fused_dispatch,
@@ -305,6 +304,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 self.local_map,
                 num_out_tokens=tokens_per_expert.sum().item(),
                 fused=self.config.moe_permute_fusion,
+                dsa_accuracy_compatible=self.config.dsa_accuracy_compatible,
             )
         )
 
@@ -652,6 +652,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
+            dsa_accuracy_compatible=self.config.dsa_accuracy_compatible,
         )
         return permutated_local_input_tokens, permuted_probs
 
@@ -1378,6 +1379,7 @@ class _DeepepManager(_DispatchManager):
             fused=self.permute_fusion,
             tokens_per_expert=self.tokens_per_expert,
             align_size=get_align_size_for_quantization(self.config),
+            dsa_accuracy_compatible=self.config.dsa_accuracy_compatible,
         )
         if self.router_dtype == "fp64":
             permuted_probs = permuted_probs.to(torch.float64)
@@ -1527,7 +1529,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         """
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        if _use_accuracy_compatible():
+        if self.config.dsa_accuracy_compatible:
             async_finish = False
             allocate_on_comm_stream = False
         dispatched_hidden_states = self._comm_manager.dispatch(
@@ -1589,7 +1591,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         # when CUDA_DEVICE_MAX_CONNECTIONS>1.
         if self.shared_experts is not None:
             self.shared_experts.wait_current_stream()
-        if _use_accuracy_compatible():
+        if self.config.dsa_accuracy_compatible:
             async_finish = False
             allocate_on_comm_stream = False
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)

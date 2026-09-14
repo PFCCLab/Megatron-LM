@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import ast
 import os
-import sys
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import List, Optional
 from unittest.mock import patch
 
@@ -41,19 +40,6 @@ class _SentinelApply(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         return (grad_output,) + (None,) * 8
-
-
-class _SentinelGather(torch.autograd.Function):
-    last = None
-
-    @staticmethod
-    def forward(ctx, input_, group):
-        _SentinelGather.last = (input_, group)
-        return input_ * 2
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
 
 
 class _FakeGroup:
@@ -99,7 +85,6 @@ def _load_named(rel: str, name: str, extra_ns=None, class_name=None):
         "_use_accuracy_compatible": _use_accuracy_compatible,
         "get_tensor_model_parallel_group_if_none": lambda g: g,
         "LinearWithGradAccumulationAndAsyncCommunication": _SentinelApply,
-        "_GatherFromModelParallelRegion": _SentinelGather,
         "parallel_state": SimpleNamespace(get_tensor_model_parallel_world_size=lambda: _TP["size"]),
         "custom_backward": _custom_backward,
         "Variable": torch.autograd.Variable,
@@ -115,9 +100,6 @@ linear_with_grad_accumulation_and_async_allreduce = _load_named(
     "megatron/core/tensor_parallel/layers.py", "linear_with_grad_accumulation_and_async_allreduce"
 )
 linear_with_grad_accumulation_and_async_allreduce.warned = True
-gather_from_tensor_model_parallel_region = _load_named(
-    "megatron/core/tensor_parallel/mappings.py", "gather_from_tensor_model_parallel_region"
-)
 deallocate_output_tensor = _load_named(
     "megatron/core/pipeline_parallel/schedules.py", "deallocate_output_tensor"
 )
@@ -151,7 +133,7 @@ class TestEmbedFp32MainGradCuda(unittest.TestCase):
             weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
             instances.append(
                 SimpleNamespace(
-                    config=SimpleNamespace(use_accuracy_compatible=enabled),
+                    config=SimpleNamespace(dsa_accuracy_compatible=enabled),
                     deterministic_mode=True,
                     tp_group=_FakeGroup(1),
                     weight=weight,
@@ -159,7 +141,7 @@ class TestEmbedFp32MainGradCuda(unittest.TestCase):
                 )
             )
         for instance in instances:
-            enabled = instance.config.use_accuracy_compatible
+            enabled = instance.config.dsa_accuracy_compatible
             with patch.dict(
                 os.environ,
                 {
@@ -279,7 +261,7 @@ class TestLinearTp1Native(unittest.TestCase):
         w = _cuda_bf16([1, 0, -1, 0, 1, 1, 1, -1, 0, 0, 1, -1], (4, 3), device).requires_grad_(True)
         b = _cuda_bf16([1, -1, 0, 2], (4,), device).requires_grad_(True)
         out = linear_with_grad_accumulation_and_async_allreduce(
-            x, w, b, False, False, False, None, 0, _FakeGroup(1)
+            x, w, b, False, False, False, None, 0, _FakeGroup(1), dsa_accuracy_compatible=True
         )
         xref = x.detach().clone().requires_grad_(True)
         wref = w.detach().clone().requires_grad_(True)
@@ -296,8 +278,8 @@ class TestLinearTp1Native(unittest.TestCase):
         torch.testing.assert_close(w.grad, wref.grad, atol=0, rtol=0)
         torch.testing.assert_close(b.grad, bref.grad, atol=0, rtol=0)
 
-    def test_off_delegates_to_native_custom_function(self):
-        _UAC["on"] = False
+    def test_global_accuracy_without_dsa_keeps_native_custom_function(self):
+        _UAC["on"] = True
         device = torch.device("cuda")
         x = torch.ones(2, 3, device=device, dtype=torch.bfloat16, requires_grad=True)
         w = torch.ones(4, 3, device=device, dtype=torch.bfloat16)
@@ -312,50 +294,14 @@ class TestLinearTp1Native(unittest.TestCase):
         x = torch.ones(2, 3, device=device, dtype=torch.bfloat16, requires_grad=True)
         w = torch.ones(4, 3, device=device, dtype=torch.bfloat16)
         linear_with_grad_accumulation_and_async_allreduce(
-            x, w, None, False, False, False, None, 0, _FakeGroup(2)
+            x, w, None, False, False, False, None, 0, _FakeGroup(2), dsa_accuracy_compatible=True
         )
         self.assertIsNotNone(_SentinelApply.last)
         _SentinelApply.last = None
         linear_with_grad_accumulation_and_async_allreduce(
-            x, w, None, False, True, False, None, 0, _FakeGroup(1)
+            x, w, None, False, True, False, None, 0, _FakeGroup(1), dsa_accuracy_compatible=True
         )
         self.assertIsNotNone(_SentinelApply.last)
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestGatherTp1Identity(unittest.TestCase):
-    def setUp(self):
-        # The production wrapper imports the gate lazily; isolate only that
-        # dependency, retaining the actual gather wrapper and routing branch.
-        module = ModuleType("megatron.core.transformer.module")
-        module._use_accuracy_compatible = _use_accuracy_compatible
-        replacement = patch.dict(sys.modules, {module.__name__: module})
-        replacement.start()
-        self.addCleanup(replacement.stop)
-
-    def tearDown(self):
-        _UAC["on"] = False
-        _SentinelGather.last = None
-
-    def test_uac_tp1_returns_same_tensor(self):
-        _UAC["on"] = True
-        t = torch.arange(6.0, device="cuda").reshape(2, 3)
-        out = gather_from_tensor_model_parallel_region(t, _FakeGroup(1))
-        self.assertIs(out, t)
-        self.assertIsNone(_SentinelGather.last)
-        out_none = gather_from_tensor_model_parallel_region(t, None)
-        self.assertIs(out_none, t)
-
-    def test_tp2_or_off_delegates_to_gather_function(self):
-        _UAC["on"] = True
-        t = torch.arange(6.0, device="cuda").reshape(2, 3)
-        out = gather_from_tensor_model_parallel_region(t, _FakeGroup(2))
-        self.assertIsNotNone(_SentinelGather.last)
-        self.assertTrue(torch.equal(out, t * 2))
-        _SentinelGather.last = None
-        _UAC["on"] = False
-        gather_from_tensor_model_parallel_region(t, _FakeGroup(1))
-        self.assertIsNotNone(_SentinelGather.last)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -370,7 +316,9 @@ class TestPipelineHelpersTp1(unittest.TestCase):
         _TP["size"] = 1
         t = torch.arange(4.0, device="cuda", requires_grad=True)
         data_before = t.data.clone()
-        deallocate_output_tensor(t, True)
+        deallocate_output_tensor(
+            t, True, SimpleNamespace(dsa_accuracy_compatible=True, tensor_model_parallel_size=1)
+        )
         torch.testing.assert_close(t.data, data_before, atol=0, rtol=0)
         self.assertEqual(tuple(t.shape), (4,))
 
@@ -397,6 +345,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
             grad_scale_func=None,
             deallocate_pipeline_outputs=True,
             tensor_model_parallel_size=1,
+            dsa_accuracy_compatible=True,
         )
         gin = backward_step(x, y, go, cfg)
         torch.testing.assert_close(gin, go * 3, atol=0, rtol=0)
@@ -411,6 +360,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
             grad_scale_func=None,
             deallocate_pipeline_outputs=True,
             tensor_model_parallel_size=1,
+            dsa_accuracy_compatible=False,
         )
         _UAC["on"] = False
         _CUSTOM_BWD["calls"] = []
@@ -421,6 +371,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
         x2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda", requires_grad=True)
         y2 = x2 * 2
         go2 = torch.ones_like(y2)
+        cfg.dsa_accuracy_compatible = True
         cfg.tensor_model_parallel_size = 2
         _UAC["on"] = True
         _CUSTOM_BWD["calls"] = []

@@ -89,8 +89,7 @@ class TestTop2Router:
             return expected
 
         monkeypatch.setattr(
-            "megatron.core.transformer.moe.router.router_gating_linear",
-            fake_router_gating_linear,
+            "megatron.core.transformer.moe.router.router_gating_linear", fake_router_gating_linear
         )
         hidden_states = torch.randn((3, 1, self.router.config.hidden_size), dtype=torch.bfloat16)
 

@@ -22,7 +22,7 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
-from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -1829,7 +1829,7 @@ class DSAttention(MegatronModule):
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         _tp_group = getattr(self.pg_collection, "tp", None)
         _tp_size = 1 if _tp_group is None else _tp_group.size()
-        if not (_use_accuracy_compatible() and _tp_size <= 1):
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
             x = x.detach()
             qr = qr.detach()
 

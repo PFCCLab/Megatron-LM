@@ -12,7 +12,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -576,7 +576,7 @@ class MoELayer(BaseMoELayer):
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
-            if _use_accuracy_compatible():
+            if self.config.dsa_accuracy_compatible:
                 orig_dtype = output.dtype
                 output = (output.float() + shared_expert_output.float()).to(orig_dtype)
             else:
@@ -651,7 +651,7 @@ class MoELayer(BaseMoELayer):
                     # logging probe: removing the nodes changes bf16 gradient sum
                     # order at the shared input, and makes the router input grad a
                     # 3-way accumulated value that PF's ThreePathCloneAlignMG splits.
-                    if _use_accuracy_compatible() and hidden_states.requires_grad:
+                    if self.config.dsa_accuracy_compatible and hidden_states.requires_grad:
                         _hs_router_path_mg = hidden_states.clone()
                         _hs_dispatcher_path_mg = hidden_states.clone()
                         _hs_shared_path_mg = hidden_states.clone()
@@ -664,13 +664,11 @@ class MoELayer(BaseMoELayer):
                         hidden_states_router = hidden_states
                         hidden_states_dispatch = hidden_states
 
-                    if _use_accuracy_compatible() and not self.shared_expert_overlap:
+                    if self.config.dsa_accuracy_compatible and not self.shared_expert_overlap:
                         self._accuracy_shared_input = hidden_states_shared
                         shared_expert_output = None
                     else:
-                        shared_expert_output = self.shared_experts_compute(
-                            hidden_states_shared
-                        )
+                        shared_expert_output = self.shared_experts_compute(hidden_states_shared)
                     probs, routing_map = self.route(hidden_states_router, padding_mask)
                     hidden_states, probs = self.preprocess(
                         hidden_states_dispatch, probs, routing_map
@@ -705,7 +703,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                if _use_accuracy_compatible():
+                if self.config.dsa_accuracy_compatible:
                     shared_input = getattr(self, "_accuracy_shared_input", None)
                     if shared_input is not None:
                         shared_expert_output = self.shared_experts_compute(shared_input)

@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.module import _use_accuracy_compatible
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -94,6 +95,7 @@ class _Fp32BackwardIndexSelect(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tokens, sorted_indices):
+        """Forward: index_select tokens by sorted_indices."""
         ctx.save_for_backward(sorted_indices)
         ctx.num_tokens = tokens.shape[0]
         ctx.hidden = tokens.shape[1]
@@ -102,6 +104,7 @@ class _Fp32BackwardIndexSelect(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Backward: fp32 scatter_add for deterministic accumulation."""
         (sorted_indices,) = ctx.saved_tensors
         grad_tokens = torch.zeros(
             (ctx.num_tokens, ctx.hidden), dtype=torch.float32, device=grad_output.device
@@ -363,6 +366,35 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
+class _PermuteAlignedAutogradFn(torch.autograd.Function):
+    """MG-aligned deterministic permute (matches PF _PermuteAlignedPyLayer).
+
+    Forward:  tokens.index_select(0, sorted_indices)
+    Backward: gather(reverse_indices) -> reshape [N, topk, H] -> sum(dim=1)
+              with fp32 internal accumulation.
+    """
+
+    @staticmethod
+    def forward(ctx, tokens, sorted_indices, reverse_indices_flat, num_tokens, topk, hidden):
+        """Forward: permute tokens by sorted_indices."""
+        ctx.input_dtype = tokens.dtype
+        ctx.num_tokens = num_tokens
+        ctx.topk = topk
+        ctx.hidden = hidden
+        ctx.save_for_backward(reverse_indices_flat)
+        permuted_input = tokens.index_select(0, sorted_indices)
+        return permuted_input
+
+    @staticmethod
+    def backward(ctx, grad_permuted):
+        """Backward: fp32 gather-reshape-sum for deterministic unpermute."""
+        (reverse_indices_flat,) = ctx.saved_tensors
+        gathered = grad_permuted.float().index_select(0, reverse_indices_flat)
+        gathered = gathered.reshape(ctx.num_tokens, ctx.topk, ctx.hidden)
+        grad_tokens = gathered.sum(dim=1)
+        return grad_tokens.to(ctx.input_dtype), None, None, None, None, None
+
+
 def permute(
     tokens: torch.Tensor,
     routing_map: torch.Tensor,
@@ -372,6 +404,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
+    dsa_accuracy_compatible: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -477,8 +510,9 @@ def permute(
             num_out_tokens is not None
         ), "num_out_tokens is required for the argsort-based permute"
 
+        rm_orig_bool = routing_map.bool()  # [num_tokens, num_experts]
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
-        routing_map = routing_map.bool().T.contiguous()
+        routing_map = rm_orig_bool.T.contiguous()
 
         # Use argsort to get indices of non-zero entries in row-major order.
         # This is equivalent to masked_select but produces fixed-shape output,
@@ -490,8 +524,32 @@ def permute(
         if probs is not None:
             permuted_probs = probs.T.contiguous().reshape(-1)[flat_sorted]
 
-    # use the mapping to permute the tokens
-    if _use_accuracy_compatible() and not drop_and_pad:
+    # === BIT-EXACT permute backward (gated by MOE_DETERMINISTIC_UNPERMUTE) ===
+    if (
+        _use_accuracy_compatible()
+        and not dsa_accuracy_compatible
+        and not (drop_and_pad and num_out_tokens is not None)
+    ):
+        rm_T_int = routing_map.long()  # [num_experts, num_tokens]
+        tokens_per_expert_local = rm_T_int.sum(dim=-1)  # [num_experts]
+        expert_offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=tokens.device)
+        expert_offsets[1:] = torch.cumsum(tokens_per_expert_local, dim=0)
+        position_in_expert_T = rm_T_int.cumsum(dim=-1) - 1  # [num_experts, num_tokens]
+        global_position = (
+            position_in_expert_T + expert_offsets[:-1].unsqueeze(1)
+        ).T  # [num_tokens, num_experts]
+
+        topk_val = int(rm_orig_bool.long().sum(dim=-1)[0].item())
+        valid_positions = global_position * rm_orig_bool.long()
+        reverse_indices_flat = torch.masked_select(valid_positions, rm_orig_bool).reshape(
+            num_tokens * topk_val
+        )
+        reverse_indices_flat.requires_grad_(False)
+
+        permuted_input = _PermuteAlignedAutogradFn.apply(
+            tokens, sorted_indices, reverse_indices_flat, num_tokens, topk_val, hidden
+        )
+    elif _use_accuracy_compatible() and not drop_and_pad:
         # fp32 确定性反向累积，复刻 PF 侧 permute backward
         permuted_input = _fp32_backward_index_select(tokens, sorted_indices)
     else:
@@ -590,24 +648,50 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
+    _use_deterministic = _use_accuracy_compatible()
+
+    if _use_deterministic and routing_map is not None:
+        # 确定性 gather+sum 实现（用于逐位对齐）
+        num_tokens = restore_shape[0]
+        num_experts = routing_map.shape[1]
+        routing_map_bool = routing_map.bool()
+        routing_map_T = routing_map_bool.T.contiguous()  # [num_experts, num_tokens]
+        tokens_per_expert_local = routing_map_T.long().sum(dim=-1)  # [num_experts]
+        expert_offsets = torch.zeros(
+            num_experts + 1, dtype=torch.long, device=permuted_tokens.device
+        )
+        expert_offsets[1:] = torch.cumsum(tokens_per_expert_local, dim=0)
+        position_in_expert_T = routing_map_T.long().cumsum(dim=-1) - 1  # [num_experts, num_tokens]
+        global_position = position_in_expert_T + expert_offsets[:-1].unsqueeze(
+            1
+        )  # [num_experts, num_tokens]
+        global_position_per_token = global_position.T  # [num_tokens, num_experts]
+        topk = int(routing_map_bool.long().sum(dim=-1)[0].item())
+        valid_positions = global_position_per_token * routing_map_bool.long()
+        reverse_indices = valid_positions[routing_map_bool].reshape(num_tokens, topk)
+        # 用 embedding lookup 替代 index_select（反向是确定性的 scatter，无累加）
+        gathered = torch.nn.functional.embedding(reverse_indices.reshape(-1), permuted_tokens)
+        gathered = gathered.reshape(num_tokens, topk, hidden)
+    else:
+        # Create an output tensor filled with zeros
         output_tokens = torch.zeros(
             restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
         )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    else:
-        # Scatter add the permuted_input back to the original positions
-        output_tokens.scatter_add_(
-            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-        )
+        if torch.are_deterministic_algorithms_enabled():
+            # Use index_add which is deterministic when deterministic algorithms are enabled
+            # and is CUDA graph compatible
+            output_tokens = torch.zeros(
+                restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+            )
+            # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
+            # and is CUDA graph compatible unlike scatter_add
+            output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+        else:
+            # Scatter add the permuted_input back to the original positions
+            output_tokens.scatter_add_(
+                0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+            )
+
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -880,13 +964,13 @@ def topk_routing_with_score_function(
     elif score_function in ("sigmoid", "sqrtsoftplus"):
         if _use_accuracy_compatible():
             if score_function == "sigmoid":
-                scores = torch.sigmoid(logits.float())
+                scores = torch.sigmoid(logits.float()).type_as(logits)
             else:
-                scores = torch.nn.functional.softplus(logits.float()).sqrt()
+                scores = torch.nn.functional.softplus(logits.float()).sqrt().type_as(logits)
             if expert_bias is not None:
                 scores_for_routing = scores + expert_bias
                 _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
-                scores = torch.gather(scores, dim=1, index=top_indices)
+                scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
             else:
                 scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
             _scores_f64 = scores.double()
