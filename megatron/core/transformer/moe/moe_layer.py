@@ -12,7 +12,7 @@ from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, _use_accuracy_compatible
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -651,7 +651,7 @@ class MoELayer(BaseMoELayer):
                     # logging probe: removing the nodes changes bf16 gradient sum
                     # order at the shared input, and makes the router input grad a
                     # 3-way accumulated value that PF's ThreePathCloneAlignMG splits.
-                    if self.config.dsa_accuracy_compatible and hidden_states.requires_grad:
+                    if _use_accuracy_compatible() and hidden_states.requires_grad:
                         _hs_router_path_mg = hidden_states.clone()
                         _hs_dispatcher_path_mg = hidden_states.clone()
                         _hs_shared_path_mg = hidden_states.clone()
