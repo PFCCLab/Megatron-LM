@@ -177,11 +177,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False, config=None
     '''
     if (out is None) or (not deallocate_pipeline_outputs):
         return
-    if (
-        config is not None
-        and config.dsa_accuracy_compatible
-        and config.tensor_model_parallel_size <= 1
-    ):
+    if config is not None and config.uses_dsa_reference and config.tensor_model_parallel_size <= 1:
         return
 
     # Handle dict format (multi-module pipelines)
@@ -575,9 +571,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
     if output_tensor[0].requires_grad:
         _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
-        if config.deallocate_pipeline_outputs and (
-            not config.dsa_accuracy_compatible or _tp_size > 1
-        ):
+        if config.deallocate_pipeline_outputs and (not config.uses_dsa_reference or _tp_size > 1):
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
@@ -652,7 +646,7 @@ def backward_step_multimodule(
         if output_tensor_module is not None and output_tensor_module.requires_grad:
             _tp_size = int(getattr(config, "tensor_model_parallel_size", 1) or 1)
             if config.deallocate_pipeline_outputs and (
-                not config.dsa_accuracy_compatible or _tp_size > 1
+                not config.uses_dsa_reference or _tp_size > 1
             ):
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:

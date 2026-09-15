@@ -34,8 +34,9 @@ def test_token_normalization_preserves_legacy_and_dsa_contracts(
     module = importlib.import_module("megatron.core.transformer.module")
     monkeypatch.setattr(module, "_use_accuracy_compatible", lambda: accuracy)
     config = TransformerConfig(
-        num_layers=1, hidden_size=8, num_attention_heads=1, dsa_accuracy_compatible=dsa
+        num_layers=1, hidden_size=8, num_attention_heads=1, use_accuracy_compatible=accuracy
     )
+    config.experimental_attention_variant = "dsa" if dsa else None
     gradient = torch.tensor(8.0, device="cuda")
     events = []
 

@@ -60,7 +60,7 @@ except ImportError:
 
 def _get_standalone_norm(config: TransformerConfig, backend: BackendSpecProvider, *, for_qk=False):
     rms_norm = config.normalization == "RMSNorm"
-    if rms_norm and config.norm_accuracy_compatible:
+    if rms_norm and config.uses_dsa_reference:
         return WrappedTorchNorm
     return backend.layer_norm(rms_norm=rms_norm, for_qk=for_qk)
 

@@ -65,7 +65,7 @@ def _make_config(**overrides):
     defaults = dict(
         num_layers=4,
         normalization="RMSNorm",
-        norm_accuracy_compatible=False,
+        uses_dsa_reference=False,
         qk_layernorm=False,
         multi_latent_attention=False,
         qk_l2_norm=False,
@@ -380,7 +380,7 @@ class TestGetDsaModuleSpec:
             qk_l2_norm=False,
             qk_layernorm=True,
             normalization="RMSNorm",
-            norm_accuracy_compatible=True,
+            uses_dsa_reference=True,
         )
         spec = self._call(cfg=cfg, backend=backend)
 

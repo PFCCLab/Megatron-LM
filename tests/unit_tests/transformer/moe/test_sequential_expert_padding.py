@@ -38,9 +38,9 @@ class TestSequentialExpertPadding:
             bias_activation_fusion=False,
             params_dtype=torch.bfloat16,
             use_accuracy_compatible=enabled,
-            dsa_accuracy_compatible=True,
             moe_grouped_gemm=grouped,
         )
+        config.experimental_attention_variant = "dsa"
         experts = SequentialMLP(
             2,
             config,

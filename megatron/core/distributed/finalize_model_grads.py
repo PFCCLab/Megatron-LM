@@ -468,7 +468,7 @@ def finalize_model_grads(
     from ..transformer.module import _use_accuracy_compatible
 
     loss_normalized_in_graph = (
-        _use_accuracy_compatible() and not config.dsa_accuracy_compatible and num_tokens is not None
+        _use_accuracy_compatible() and not config.uses_dsa_reference and num_tokens is not None
     )
     if loss_normalized_in_graph:
         num_tokens = None
@@ -575,7 +575,7 @@ def finalize_model_grads(
             for model_chunk in model:
                 model_chunk.scale_gradients(1.0 / dp_size)
 
-    if loss_normalized_in_graph or config.dsa_accuracy_compatible:
+    if loss_normalized_in_graph or config.uses_dsa_reference:
         for model_chunk in model:
             for param in model_chunk.parameters():
                 gate_wgrad = getattr(param, "_run_torch_gate_fp32_wgrad", None)
