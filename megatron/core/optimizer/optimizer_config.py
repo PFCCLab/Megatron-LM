@@ -247,9 +247,6 @@ class OptimizerConfig:
     adam_eps: float = 1e-08
     """Term added to the denominator to improve numerical stability in Adam optimizer."""
 
-    native_unfused_adamw: bool = False
-    """Use torch.optim.AdamW with foreach=False and fused=False instead of TE/Apex Adam."""
-
     decoupled_weight_decay: bool = True
     """If true, decouples weight decay from the gradient update, equivalent to AdamW. If false,
     original Adam update rule will be used. Defaults to True.
@@ -371,8 +368,8 @@ class OptimizerConfig:
     ################
     # Miscellaneous
     ################
-    reproducible_grad_norm: bool = False
-    """Use a partition-independent FP32 gradient norm when clipping is enabled."""
+    use_accuracy_compatible: bool = False
+    """Select reference optimizer numerics and reproducible gradient clipping."""
 
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""

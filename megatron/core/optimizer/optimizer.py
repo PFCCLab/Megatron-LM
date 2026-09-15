@@ -304,7 +304,8 @@ class MegatronOptimizer(ABC):
         total_norm = get_grad_norm_fp32(
             grads_for_norm,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            reproducible_grad_norm=self.config.reproducible_grad_norm and self.config.clip_grad > 0,
+            use_accuracy_compatible=self.config.use_accuracy_compatible
+            and self.config.clip_grad > 0,
         )
         return total_norm
 
@@ -318,7 +319,7 @@ class MegatronOptimizer(ABC):
                 group_grad_norm = get_grad_norm_fp32(
                     grouped_grads,
                     grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                    reproducible_grad_norm=self.config.reproducible_grad_norm
+                    use_accuracy_compatible=self.config.use_accuracy_compatible
                     and self.config.clip_grad > 0,
                 )
                 self.grad_norms_by_group[grad_norm_group] = group_grad_norm
@@ -339,7 +340,8 @@ class MegatronOptimizer(ABC):
         grad_norm = get_grad_norm_fp32(
             grads_for_norm,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            reproducible_grad_norm=self.config.reproducible_grad_norm and self.config.clip_grad > 0,
+            use_accuracy_compatible=self.config.use_accuracy_compatible
+            and self.config.clip_grad > 0,
         )
 
         if clip_grad > 0.0 and params:
@@ -1592,7 +1594,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def get_grad_norm(self):
-        if self.config.reproducible_grad_norm and self.config.clip_grad > 0:
+        if self.config.use_accuracy_compatible and self.config.clip_grad > 0:
             return self._get_reproducible_grad_norm()
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
@@ -1657,7 +1659,7 @@ class ChainedOptimizer(MegatronOptimizer):
     def _get_grad_norm_for_group(self, grad_norm_group: str):
         """Compute gradient norm for a named parameter group."""
         _validate_grad_norm_group(grad_norm_group)
-        if self.config.reproducible_grad_norm and self.config.clip_grad > 0:
+        if self.config.use_accuracy_compatible and self.config.clip_grad > 0:
             return self._get_reproducible_grad_norm(grad_norm_group)
         if self.grads_states_parallel_group_is_shared():
             grouped_grads = []

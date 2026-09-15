@@ -80,7 +80,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-    reproducible_grad_norm: bool = False,
+    use_accuracy_compatible: bool = False,
 ) -> float:
     """Calculate the p-norm of gradients in FP32 precision.
 
@@ -105,7 +105,7 @@ def get_grad_norm_fp32(
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
 
-    if reproducible_grad_norm:
+    if use_accuracy_compatible:
         if float(norm_type) != 2.0:
             raise ValueError("Reproducible clipping supports only the L2 norm")
         bins = get_reproducible_grad_norm_bins(grads_for_norm, grad_stats_parallel_group)

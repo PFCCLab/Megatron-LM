@@ -206,7 +206,7 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
-            if _use_accuracy_compatible() and not self.config.dsa_accuracy_compatible:
+            if _use_accuracy_compatible() and not self.config.uses_dsa_reference:
                 s, b = labels.shape
                 loss = torch.nn.functional.cross_entropy(
                     logits.float().reshape(s * b, -1),  # [s*b, vocab]
@@ -231,7 +231,7 @@ class LanguageModule(MegatronModule):
             import hashlib as _hashlib
 
             _l = loss.detach().float().contiguous()
-            print(
+            print(  # pylint: disable=bad-builtin
                 f"\nper_token_loss: rank={torch.distributed.get_rank()} "
                 f"shape={list(_l.shape)} "
                 f"md5={_hashlib.md5(_l.cpu().numpy().tobytes()).hexdigest()}",

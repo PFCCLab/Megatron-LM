@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.optimizer as optimizer_module
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -62,7 +63,7 @@ def test_chained_owner_groups_and_clipping(monkeypatch):
         group = torch.distributed.new_group([member])
         if member == rank:
             singleton = group
-    config = OptimizerConfig(reproducible_grad_norm=True, clip_grad=1.0)
+    config = OptimizerConfig(use_accuracy_compatible=True, clip_grad=1.0)
     # Dense 3 and 4 have distinct owners; the expert 12 is replicated between
     # singleton stats groups. Finishing each child separately loses this contract.
     dense = [torch.tensor([3.0 if rank == 0 else 4.0], device='cuda')] if rank < 2 else []
@@ -93,7 +94,7 @@ def test_chained_owner_groups_and_clipping(monkeypatch):
 
 @pytest.mark.parametrize('enabled,clip', [(False, 1.0), (True, 0.0)])
 def test_stock_norm_when_disabled_or_not_clipping(monkeypatch, enabled, clip):
-    config = OptimizerConfig(reproducible_grad_norm=enabled, clip_grad=clip)
+    config = OptimizerConfig(use_accuracy_compatible=enabled, clip_grad=clip)
     optimizer = ChainedOptimizer([SimpleNamespace(config=config, get_grad_norm=lambda: 7.0)])
 
     def unexpected(*args, **kwargs):
@@ -119,3 +120,25 @@ def distributed_norm_device():
 @pytest.fixture(scope='session')
 def ensure_test_data():
     """The norm tests are self-contained and do not consume external datasets."""
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_optimizer_mode_selects_native_adam_without_secondary_flags(monkeypatch, enabled):
+    monkeypatch.setenv("USE_ACCURACY_COMPATIBLE", str(int(not enabled)))
+    config = OptimizerConfig(use_accuracy_compatible=enabled, lr=1e-3)
+    parameter = torch.nn.Parameter(torch.tensor([1.0], device="cuda"))
+    optimizer, _ = optimizer_module._get_megatron_optimizer_based_on_param_groups(
+        config, [], [{"params": [parameter]}], skip_megatron_wrapping=True
+    )
+    if enabled:
+        assert type(optimizer) is torch.optim.AdamW
+        assert optimizer.defaults["fused"] is True
+        assert optimizer.defaults["foreach"] is False
+    else:
+        expected = (
+            torch.optim.AdamW if optimizer_module.USING_PYTORCH_OPTIMIZER else optimizer_module.Adam
+        )
+        assert type(optimizer) is expected
+    parameter.grad = torch.ones_like(parameter)
+    optimizer.step()
+    assert parameter.item() < 1.0
