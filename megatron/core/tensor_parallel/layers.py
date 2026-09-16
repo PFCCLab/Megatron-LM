@@ -349,7 +349,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Get the embeddings.
         if self.deterministic_mode:
             _tp_size = 1 if self.tp_group is None else self.tp_group.size()
-            if getattr(self.config, "uses_dsa_reference", False) and _tp_size <= 1:
+            if getattr(self.config, "dsa_accuracy_compatible", False) and _tp_size <= 1:
                 output_parallel = _EmbedFp32MainGrad.apply(self.weight, masked_input)
             else:
                 output_parallel = self.weight[masked_input]
@@ -728,7 +728,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    use_accuracy_compatible: bool = False,
+    dsa_accuracy_compatible: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -795,7 +795,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     _tp_size = 1 if tp_group is None else tp_group.size()
-    if use_accuracy_compatible and _tp_size <= 1 and not sequence_parallel and not allreduce_dgrad:
+    if dsa_accuracy_compatible and _tp_size <= 1 and not sequence_parallel and not allreduce_dgrad:
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
@@ -846,7 +846,7 @@ def _expert_grads_need_own_dp_domain(config) -> bool:
     """
     if config.expert_model_parallel_size > 1:
         return True
-    if not getattr(config, "uses_dsa_reference", False):
+    if not getattr(config, 'dsa_accuracy_compatible', False):
         return False
     etp = getattr(config, 'expert_tensor_parallel_size', None)
     if etp is None:
@@ -1080,7 +1080,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 input,
                 weight,
                 *args,
-                use_accuracy_compatible=getattr(self.config, "uses_dsa_reference", False),
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
                 **kwargs,
             )
 
@@ -1130,7 +1130,7 @@ class ColumnParallelLinear(torch.nn.Module):
             or self.disable_grad_reduce
         ):
             input_parallel = input_
-        elif getattr(self.config, "uses_dsa_reference", False) and (
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
             self.tp_group is None or self.tp_group.size() <= 1
         ):
             input_parallel = input_
@@ -1180,7 +1180,7 @@ class ColumnParallelLinear(torch.nn.Module):
             gather_output = runtime_gather_output
 
         if gather_output and (
-            not getattr(self.config, "uses_dsa_reference", False)
+            not getattr(self.config, "dsa_accuracy_compatible", False)
             or (self.tp_group is not None and self.tp_group.size() > 1)
         ):
             # All-gather across the partitions.
@@ -1415,7 +1415,7 @@ class RowParallelLinear(torch.nn.Module):
                 input,
                 weight,
                 *args,
-                use_accuracy_compatible=getattr(self.config, "uses_dsa_reference", False),
+                dsa_accuracy_compatible=getattr(self.config, "dsa_accuracy_compatible", False),
                 **kwargs,
             )
 
@@ -1467,7 +1467,7 @@ class RowParallelLinear(torch.nn.Module):
             output_ = reduce_scatter_to_sequence_parallel_region(
                 output_parallel, group=self.tp_group
             )
-        elif getattr(self.config, "uses_dsa_reference", False) and (
+        elif getattr(self.config, "dsa_accuracy_compatible", False) and (
             self.tp_group is None or self.tp_group.size() <= 1
         ):
             output_ = output_parallel

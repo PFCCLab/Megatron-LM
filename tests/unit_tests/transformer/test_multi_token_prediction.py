@@ -92,10 +92,9 @@ class TestMultiTokenPredictionLayer:
             hidden_size=64,
             num_attention_heads=8,
             normalization="RMSNorm",
-            use_accuracy_compatible=True,
+            norm_accuracy_compatible=True,
             use_cpu_initialization=True,
         )
-        config.experimental_attention_variant = "dsa"
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=True

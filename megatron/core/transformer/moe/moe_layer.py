@@ -576,7 +576,7 @@ class MoELayer(BaseMoELayer):
             output, _ = self.fc2_latent_proj(output)
 
         if shared_expert_output is not None:
-            if self.config.uses_dsa_reference:
+            if self.config.dsa_accuracy_compatible:
                 orig_dtype = output.dtype
                 output = (output.float() + shared_expert_output.float()).to(orig_dtype)
             else:
@@ -664,7 +664,7 @@ class MoELayer(BaseMoELayer):
                         hidden_states_router = hidden_states
                         hidden_states_dispatch = hidden_states
 
-                    if self.config.uses_dsa_reference and not self.shared_expert_overlap:
+                    if self.config.dsa_accuracy_compatible and not self.shared_expert_overlap:
                         self._accuracy_shared_input = hidden_states_shared
                         shared_expert_output = None
                     else:
@@ -703,7 +703,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                if self.config.uses_dsa_reference:
+                if self.config.dsa_accuracy_compatible:
                     shared_input = getattr(self, "_accuracy_shared_input", None)
                     if shared_input is not None:
                         shared_expert_output = self.shared_experts_compute(shared_input)
