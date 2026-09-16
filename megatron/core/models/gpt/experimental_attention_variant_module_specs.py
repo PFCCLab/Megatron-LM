@@ -20,7 +20,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -58,13 +57,6 @@ except ImportError:
 ##########
 
 
-def _get_standalone_norm(config: TransformerConfig, backend: BackendSpecProvider, *, for_qk=False):
-    rms_norm = config.normalization == "RMSNorm"
-    if rms_norm and config.norm_accuracy_compatible:
-        return WrappedTorchNorm
-    return backend.layer_norm(rms_norm=rms_norm, for_qk=for_qk)
-
-
 def get_gated_delta_net_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -73,11 +65,12 @@ def get_gated_delta_net_module_spec(
     if backend is None:
         backend = _get_backend_spec_provider(config=config)
 
+    rms_norm = config.normalization == "RMSNorm"
     attention = ModuleSpec(
         module=GatedDeltaNet,
         submodules=GatedDeltaNetSubmodules(
             in_proj=backend.column_parallel_layer_norm_linear(),
-            out_norm=_get_standalone_norm(config, backend),
+            out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
             out_proj=backend.row_parallel_linear(),
         ),
         metainfo={"fuse_input_layernorm": True},
@@ -109,10 +102,12 @@ def get_dsa_module_spec_for_backend(
         ),
     )
 
+    # Adjust for RMS norm.
+    rms_norm = config.normalization == "RMSNorm"
     # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
     # with linear projection and have to use unfused qk layernorm.
     qk_norm = (
-        _get_standalone_norm(config, backend, for_qk=True) if config.qk_layernorm else IdentityOp
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
     )
 
     attention = ModuleSpec(
@@ -233,6 +228,7 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         dense_mlp_layer_spec, fuse_layernorm_pre_dense = None, False
 
     # Get GPT decoder block layer specs
+    rms_norm = config.normalization == "RMSNorm"
     layer_specs = []
     for layer_number in range(config.num_layers):
         attention = (
@@ -249,10 +245,12 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         input_layernorm = (
             IdentityOp
             if attention.metainfo["fuse_input_layernorm"]
-            else _get_standalone_norm(config, backend)
+            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
         pre_mlp_layernorm = (
-            IdentityOp if fuse_pre_mlp_layernorm else _get_standalone_norm(config, backend)
+            IdentityOp
+            if fuse_pre_mlp_layernorm
+            else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
 
         layer_specs.append(
@@ -319,8 +317,9 @@ def get_transformer_block_with_experimental_attention_variant_spec(
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
 
     # Get GPT decoder block spec
+    rms_norm = config.normalization == "RMSNorm"
     gpt_decoder_block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=_get_standalone_norm(config, backend)
+        layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
     )
 
     return gpt_decoder_block_spec
