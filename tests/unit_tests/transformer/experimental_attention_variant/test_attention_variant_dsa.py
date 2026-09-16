@@ -117,7 +117,7 @@ class TestAccuracyCompatibleDSA:
             key_positions=None,
         )
         _run_sparse_attention(config=SimpleNamespace(), **common)
-        _run_sparse_attention(config=SimpleNamespace(dsa_accuracy_compatible=True), **common)
+        _run_sparse_attention(config=SimpleNamespace(uses_dsa_reference=True), **common)
 
         assert calls == [False, True]
 

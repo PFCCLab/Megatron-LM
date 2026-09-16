@@ -121,6 +121,7 @@ class _AccuracyCompatibleSoftmax(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, logits: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """Compute softmax over valid entries and retain its probabilities."""
         probabilities = torch.softmax(logits.masked_fill(~valid_mask, float("-inf")), dim=-1)
         probabilities = probabilities.masked_fill(~valid_mask, 0.0)
         ctx.save_for_backward(probabilities, valid_mask)
@@ -128,6 +129,7 @@ class _AccuracyCompatibleSoftmax(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        """Apply the explicit softmax gradient and clear masked entries."""
         probabilities, valid_mask = ctx.saved_tensors
         grad_logits = probabilities * (
             grad_output - (grad_output * probabilities).sum(dim=-1, keepdim=True)
@@ -152,7 +154,7 @@ def _run_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run sparse attention for absorbed and non-absorbed MLA paths."""
-    accuracy_compatible = bool(getattr(config, "dsa_accuracy_compatible", False))
+    accuracy_compatible = bool(getattr(config, "uses_dsa_reference", False))
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -1829,7 +1831,7 @@ class DSAttention(MegatronModule):
         # Detach x and qr to prevent gradients of indexer from flowing back to the main model.
         _tp_group = getattr(self.pg_collection, "tp", None)
         _tp_size = 1 if _tp_group is None else _tp_group.size()
-        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+        if not (self.config.uses_dsa_reference and _tp_size <= 1):
             x = x.detach()
             qr = qr.detach()
 

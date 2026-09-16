@@ -606,7 +606,7 @@ def get_mtp_layer_spec_for_backend(
     column_parallel_linear_impl: type = backend.column_parallel_linear()
     layer_norm_impl = (
         WrappedTorchNorm
-        if config is not None and config.norm_accuracy_compatible
+        if config is not None and config.uses_dsa_reference
         else backend.layer_norm()
     )
     mtp_layer_spec = ModuleSpec(
@@ -1116,7 +1116,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             decoder_input = decoder_input.detach()
 
         _tp_size = 1 if self.tp_group is None else self.tp_group.size()
-        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+        if not (self.config.uses_dsa_reference and _tp_size <= 1):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
@@ -1136,12 +1136,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         _tp_size = 1 if self.tp_group is None else self.tp_group.size()
         decoder_input = apply_module(self.enorm)(decoder_input)
-        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+        if not (self.config.uses_dsa_reference and _tp_size <= 1):
             decoder_input = make_viewless_tensor(
                 inp=decoder_input, requires_grad=True, keep_graph=True
             )
         hidden_states = apply_module(self.hnorm)(hidden_states)
-        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+        if not (self.config.uses_dsa_reference and _tp_size <= 1):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
@@ -1155,7 +1155,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = inference_all_gather_from_tensor_model_parallel_region(
                 hidden_states, self.tp_group, self.config
             )
-        elif not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
+        elif not (self.config.uses_dsa_reference and _tp_size <= 1):
             hidden_states = gather_from_tensor_model_parallel_region(
                 hidden_states, group=self.tp_group
             )

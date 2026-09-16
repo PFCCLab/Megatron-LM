@@ -1352,7 +1352,7 @@ class SequentialMLP(MegatronModule):
                 # grouped-storage fallback uses real token counts instead.
                 num_real_tokens = tokens.shape[0]
                 pad_small_expert = _use_accuracy_compatible() and 0 < num_real_tokens < 17
-                if self.config.dsa_accuracy_compatible:
+                if self.config.uses_dsa_reference:
                     pad_small_expert = (
                         self.config.use_accuracy_compatible
                         and not self.config.moe_grouped_gemm
