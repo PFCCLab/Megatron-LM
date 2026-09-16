@@ -67,8 +67,7 @@ class TestTop2Router:
         hidden_states = torch.randn(
             (3, 1, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
         )
-        self.router.config.use_accuracy_compatible = True
-        self.router.config.experimental_attention_variant = "dsa"
+        self.router.config.router_accuracy_compatible = True
 
         logits = self.router.gating(hidden_states)
         expected = torch.mm(
@@ -94,7 +93,7 @@ class TestTop2Router:
         )
         hidden_states = torch.randn((3, 1, self.router.config.hidden_size), dtype=torch.bfloat16)
 
-        assert self.router.config.uses_dsa_reference is False
+        assert self.router.config.router_accuracy_compatible is False
         assert self.router.gating(hidden_states) is expected
         assert called
 

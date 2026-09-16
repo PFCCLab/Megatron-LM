@@ -404,7 +404,7 @@ def permute(
     drop_and_pad: bool = False,
     tokens_per_expert: Optional[torch.Tensor] = None,
     align_size: int = 0,
-    use_accuracy_compatible: bool = False,
+    dsa_accuracy_compatible: bool = False,
 ) -> Tuple[
     torch.Tensor,
     Optional[torch.Tensor],
@@ -527,7 +527,7 @@ def permute(
     # === BIT-EXACT permute backward (gated by MOE_DETERMINISTIC_UNPERMUTE) ===
     if (
         _use_accuracy_compatible()
-        and not use_accuracy_compatible
+        and not dsa_accuracy_compatible
         and not (drop_and_pad and num_out_tokens is not None)
     ):
         rm_T_int = routing_map.long()  # [num_experts, num_tokens]

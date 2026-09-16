@@ -591,7 +591,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         #   already creates viewless tensors. That said, make_viewless_tensor()
         #   is called here to be future-proof and corner-case-proof.
         _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
-        if not (self.config.uses_dsa_reference and _tp_size <= 1):
+        if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
@@ -699,7 +699,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.
             _tp_size = int(getattr(self.config, "tensor_model_parallel_size", 1) or 1)
-            if not (self.config.uses_dsa_reference and _tp_size <= 1):
+            if not (self.config.dsa_accuracy_compatible and _tp_size <= 1):
                 hidden_states = make_viewless_tensor(
                     inp=hidden_states, requires_grad=True, keep_graph=True
                 )

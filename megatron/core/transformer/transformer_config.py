@@ -186,6 +186,16 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Epsilon value for any LayerNorm/RMSNorm operations."""
 
+    norm_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--norm-accuracy-compatible"]}}
+    )
+    """Use native Torch RMSNorm modules instead of Transformer Engine norm modules for alignment."""
+
+    router_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--router-accuracy-compatible"]}}
+    )
+    """Use an explicit fp32 router GEMM instead of the fused Transformer Engine path."""
+
     layernorm_zero_centered_gamma: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--apply-layernorm-1p"]}}
     )
@@ -324,6 +334,14 @@ class TransformerConfig(ModelParallelConfig):
     """Optional fused DSA kernel backend.
     ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
     backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+
+    dsa_accuracy_compatible: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--dsa-accuracy-compatible"]}}
+    )
+    """Use DSA reference numerics: explicit softmax backward, deferred token-loss
+    normalization, FP32 MoE accumulation and TP1 autograd paths. Disabled by
+    default to preserve existing models' accuracy-compatible behavior.
+    """
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -1230,11 +1248,6 @@ class TransformerConfig(ModelParallelConfig):
     offload for that name. 1 = at most one not-yet-waited offload per name, etc. None = do not
     insert these joins. This feature is particularly useful when using with full-iteration CUDA
     graphs"""
-
-    @property
-    def uses_dsa_reference(self) -> bool:
-        """Select DSA reference numerics from the shared mode and model architecture."""
-        return self.use_accuracy_compatible and self.experimental_attention_variant == "dsa"
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

@@ -87,7 +87,7 @@ class _FakeComm:
 class _Flex:
     @property
     def config(self):
-        return SimpleNamespace(uses_dsa_reference=_UAC["on"])
+        return SimpleNamespace(dsa_accuracy_compatible=_UAC["on"])
 
     def __init__(self):
         self.shared_experts = None
@@ -101,7 +101,7 @@ class _MoE:
     @property
     def config(self):
         return SimpleNamespace(
-            uses_dsa_reference=_UAC["on"],
+            dsa_accuracy_compatible=_UAC["on"],
             sequence_parallel=True,
             moe_shared_expert_overlap=False,
             moe_latent_size=0,

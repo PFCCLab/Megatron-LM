@@ -133,7 +133,7 @@ class TestEmbedFp32MainGradCuda(unittest.TestCase):
             weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
             instances.append(
                 SimpleNamespace(
-                    config=SimpleNamespace(uses_dsa_reference=enabled),
+                    config=SimpleNamespace(dsa_accuracy_compatible=enabled),
                     deterministic_mode=True,
                     tp_group=_FakeGroup(1),
                     weight=weight,
@@ -141,7 +141,7 @@ class TestEmbedFp32MainGradCuda(unittest.TestCase):
                 )
             )
         for instance in instances:
-            enabled = instance.config.uses_dsa_reference
+            enabled = instance.config.dsa_accuracy_compatible
             with patch.dict(
                 os.environ,
                 {
@@ -261,7 +261,7 @@ class TestLinearTp1Native(unittest.TestCase):
         w = _cuda_bf16([1, 0, -1, 0, 1, 1, 1, -1, 0, 0, 1, -1], (4, 3), device).requires_grad_(True)
         b = _cuda_bf16([1, -1, 0, 2], (4,), device).requires_grad_(True)
         out = linear_with_grad_accumulation_and_async_allreduce(
-            x, w, b, False, False, False, None, 0, _FakeGroup(1), use_accuracy_compatible=True
+            x, w, b, False, False, False, None, 0, _FakeGroup(1), dsa_accuracy_compatible=True
         )
         xref = x.detach().clone().requires_grad_(True)
         wref = w.detach().clone().requires_grad_(True)
@@ -294,12 +294,12 @@ class TestLinearTp1Native(unittest.TestCase):
         x = torch.ones(2, 3, device=device, dtype=torch.bfloat16, requires_grad=True)
         w = torch.ones(4, 3, device=device, dtype=torch.bfloat16)
         linear_with_grad_accumulation_and_async_allreduce(
-            x, w, None, False, False, False, None, 0, _FakeGroup(2), use_accuracy_compatible=True
+            x, w, None, False, False, False, None, 0, _FakeGroup(2), dsa_accuracy_compatible=True
         )
         self.assertIsNotNone(_SentinelApply.last)
         _SentinelApply.last = None
         linear_with_grad_accumulation_and_async_allreduce(
-            x, w, None, False, True, False, None, 0, _FakeGroup(1), use_accuracy_compatible=True
+            x, w, None, False, True, False, None, 0, _FakeGroup(1), dsa_accuracy_compatible=True
         )
         self.assertIsNotNone(_SentinelApply.last)
 
@@ -317,7 +317,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
         t = torch.arange(4.0, device="cuda", requires_grad=True)
         data_before = t.data.clone()
         deallocate_output_tensor(
-            t, True, SimpleNamespace(uses_dsa_reference=True, tensor_model_parallel_size=1)
+            t, True, SimpleNamespace(dsa_accuracy_compatible=True, tensor_model_parallel_size=1)
         )
         torch.testing.assert_close(t.data, data_before, atol=0, rtol=0)
         self.assertEqual(tuple(t.shape), (4,))
@@ -345,7 +345,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
             grad_scale_func=None,
             deallocate_pipeline_outputs=True,
             tensor_model_parallel_size=1,
-            uses_dsa_reference=True,
+            dsa_accuracy_compatible=True,
         )
         gin = backward_step(x, y, go, cfg)
         torch.testing.assert_close(gin, go * 3, atol=0, rtol=0)
@@ -360,7 +360,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
             grad_scale_func=None,
             deallocate_pipeline_outputs=True,
             tensor_model_parallel_size=1,
-            uses_dsa_reference=False,
+            dsa_accuracy_compatible=False,
         )
         _UAC["on"] = False
         _CUSTOM_BWD["calls"] = []
@@ -371,7 +371,7 @@ class TestPipelineHelpersTp1(unittest.TestCase):
         x2 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], device="cuda", requires_grad=True)
         y2 = x2 * 2
         go2 = torch.ones_like(y2)
-        cfg.uses_dsa_reference = True
+        cfg.dsa_accuracy_compatible = True
         cfg.tensor_model_parallel_size = 2
         _UAC["on"] = True
         _CUSTOM_BWD["calls"] = []

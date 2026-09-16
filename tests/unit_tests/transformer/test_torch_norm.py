@@ -15,13 +15,11 @@ def _config(**overrides):
         "normalization": "RMSNorm",
     }
     values.update(overrides)
-    config = TransformerConfig(**values)
-    config.experimental_attention_variant = "dsa"
-    return config
+    return TransformerConfig(**values)
 
 
 def test_rmsnorm_uses_native_torch_implementation():
-    config = _config(use_accuracy_compatible=True, params_dtype=torch.bfloat16)
+    config = _config(norm_accuracy_compatible=True, params_dtype=torch.bfloat16)
     norm = WrappedTorchNorm(config=config, hidden_size=64, eps=1e-5)
 
     assert isinstance(norm, torch.nn.RMSNorm)
@@ -36,17 +34,7 @@ def test_sequence_parallel_is_opt_in_for_native_norm():
             eps=1e-5,
         )
     config = _config(
-        sequence_parallel=True, tensor_model_parallel_size=2, use_accuracy_compatible=True
+        sequence_parallel=True, tensor_model_parallel_size=2, norm_accuracy_compatible=True
     )
     norm = WrappedTorchNorm(config=config, hidden_size=64, eps=1e-5)
     assert all(parameter.sequence_parallel for parameter in norm.parameters())
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("variant", [None, "dsa"])
-def test_reference_mode_follows_one_switch_and_architecture(enabled, variant):
-    config = _config(use_accuracy_compatible=enabled)
-    config.experimental_attention_variant = variant
-    assert config.uses_dsa_reference is (enabled and variant == "dsa")
-    with pytest.raises(AttributeError):
-        config.uses_dsa_reference = True

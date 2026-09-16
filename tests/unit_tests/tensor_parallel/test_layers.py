@@ -18,10 +18,10 @@ def test_expert_grads_need_own_dp_domain_etp_lt_tp():
         expert_model_parallel_size=1,
         tensor_model_parallel_size=2,
         expert_tensor_parallel_size=1,
-        uses_dsa_reference=True,
+        dsa_accuracy_compatible=True,
     )
     assert _expert_grads_need_own_dp_domain(frozen) is True
-    frozen.uses_dsa_reference = False
+    frozen.dsa_accuracy_compatible = False
     assert _expert_grads_need_own_dp_domain(frozen) is False
     eq = SimpleNamespace(
         expert_model_parallel_size=1, tensor_model_parallel_size=2, expert_tensor_parallel_size=2

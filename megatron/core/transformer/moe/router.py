@@ -104,7 +104,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        if self.config.uses_dsa_reference:
+        if self.config.router_accuracy_compatible:
             inp_shape = input.shape
             logits = torch.mm(input.reshape(-1, inp_shape[-1]).float(), self.weight.float().t())
             if self.bias is not None:
