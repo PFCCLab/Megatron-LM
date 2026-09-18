@@ -10,6 +10,10 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
 )
+from megatron.core.transformer.multi_latent_attention import (
+    MLASelfAttention,
+    MLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexer,
     DSAIndexerSubmodules,
@@ -114,6 +118,25 @@ def get_dsa_module_spec_for_backend(
     qk_norm = (
         _get_standalone_norm(config, backend, for_qk=True) if config.qk_layernorm else IdentityOp
     )
+
+    if getattr(config, "use_accuracy_compatible", False):
+        attention = ModuleSpec(
+            module=MLASelfAttention,
+            params={"attn_mask_type": AttnMaskType.causal},
+            submodules=MLASelfAttentionSubmodules(
+                linear_q_proj=backend.column_parallel_linear(),
+                linear_q_down_proj=backend.linear(),
+                linear_q_up_proj=backend.column_parallel_linear(),
+                linear_kv_down_proj=backend.linear(),
+                linear_kv_up_proj=backend.column_parallel_linear(),
+                core_attention=core_attention,
+                linear_proj=backend.row_parallel_linear(),
+                q_layernorm=qk_norm,
+                kv_layernorm=qk_norm,
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+        return attention
 
     attention = ModuleSpec(
         module=AbsorbedMLASelfAttention,
