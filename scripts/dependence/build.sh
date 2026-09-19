@@ -46,6 +46,21 @@ megatron_build (){
 
     python -m pip install --upgrade pip
     python -m pip install build "setuptools>=80" pybind11 packaging
+
+    # --- reproducible build ---------------------------------------------------
+    # Pin the wheel's embedded timestamps (zip member mtimes, RECORD) to the
+    # source commit time so rebuilding the SAME commit yields a byte-identical
+    # wheel. Falls back to a fixed epoch when the source is not a git checkout
+    # (e.g. built from a tarball), keeping `set -e` from aborting the build.
+    export SOURCE_DATE_EPOCH="$(git -C "$megatron_dir" show -s --format=%ct HEAD 2>/dev/null || echo 315532800)"
+    # Deterministic C/C++ compile + link flags for the helpers_cpp extension:
+    #   -ffile-prefix-map strips the absolute build path baked into the object,
+    #   -frandom-seed makes symbol mangling / gensyms stable across builds,
+    #   -g0 drops debug info, --build-id=none removes the random ELF build-id.
+    export CFLAGS="${CFLAGS:-} -ffile-prefix-map=${megatron_dir}=. -frandom-seed=helpers_cpp -g0"
+    export CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=${megatron_dir}=. -frandom-seed=helpers_cpp -g0"
+    export LDFLAGS="${LDFLAGS:-} -Wl,--build-id=none"
+    # --------------------------------------------------------------------------
     NO_VCS_VERSION=1 python -m build --wheel --no-isolation
 
     echo "install_megatron_develop_whl"
